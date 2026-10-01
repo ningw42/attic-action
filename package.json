@@ -5,9 +5,13 @@
 	"author": "Ryan Cao <hello@ryanccn.dev>",
 	"license": "MIT",
 	"scripts": {
-		"build": "esbuild src/index.ts --outdir=dist --platform=node --format=cjs --bundle --minify-whitespace --minify-syntax",
+		"build": "esbuild src/index.ts src/post-build-hook.ts --outdir=dist --platform=node --format=cjs --bundle --minify-whitespace --minify-syntax",
 		"check": "tsc --noEmit",
+		"test": "node --test --experimental-test-coverage",
 		"format": "prettier --write ."
+	},
+	"engines": {
+		"node": ">=24"
 	},
 	"dependencies": {
 		"@actions/core": "^3.0.1",
