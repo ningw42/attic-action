@@ -10,6 +10,7 @@ import {
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -132,7 +133,7 @@ const fixture = (
 		originalHook?: "success" | "nonzero" | "signal" | "missing";
 	} = {},
 ) => {
-	const root = mkdtempSync(join(tmpdir(), "attic-action-test-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "attic-action-test-")));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const bin = join(root, "bin");
 	const runnerTemp = join(root, "runner");

@@ -6,6 +6,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -67,7 +68,7 @@ type SetupResult = {
 
 const fixture = (t: TestContext) => {
 	assert.ok(nixExecutable);
-	const root = mkdtempSync(join(tmpdir(), "attic-nix-config-test-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "attic-nix-config-test-")));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const home = join(root, "home");
 	const configHome = join(home, ".config");

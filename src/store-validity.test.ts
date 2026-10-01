@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { test } from "node:test";
@@ -21,7 +21,7 @@ test("real Nix validity drops deleted and existing-unregistered captures while p
 		assert.equal(result.status, 0, result.stderr);
 	}
 
-	const root = mkdtempSync(join(tmpdir(), "attic-validity-test-"));
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "attic-validity-test-")));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const runtime = join(root, "runtime");
 	const bin = join(root, "bin");
