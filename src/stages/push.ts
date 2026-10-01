@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 import { exec } from "@actions/exec";
+import stringArgv from "string-argv";
 
 import {
 	applyPathFilters,
@@ -25,6 +26,7 @@ export const push = async () => {
 		} else {
 			const cache = core.getInput("cache");
 			const pathDiscovery = getPathDiscovery();
+			const pushArgs = stringArgv(core.getInput("push-args"));
 			core.info("Pushing to cache");
 
 			let pushPaths: string[];
@@ -47,7 +49,7 @@ export const push = async () => {
 			core.info(`Discovered ${pushPaths.length} store path(s) to push using ${pathDiscovery}`);
 
 			if (!INTERNAL_DRY_RUN) {
-				await exec("attic", ["push", "--stdin", cache], {
+				await exec("attic", ["push", ...pushArgs, "--stdin", cache], {
 					input: Buffer.from(pushPaths.join("\n")),
 				});
 			} else {

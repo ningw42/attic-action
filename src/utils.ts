@@ -1,5 +1,5 @@
 import * as core from "@actions/core";
-import { exec } from "@actions/exec";
+import { getExecOutput } from "@actions/exec";
 
 import { chmod, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -61,22 +61,33 @@ export const getPathDiscovery = (): PathDiscovery => {
 	);
 };
 
+const STORE_PATHS = `${process.env["RUNNER_TEMP"] || "/tmp"}/attic-action-store-paths`;
+
 export const saveStorePaths = async () => {
-	await exec("sh", [
-		"-c",
-		"nix path-info --all --json --json-format 2 > ${RUNNER_TEMP:-/tmp}/attic-action-store-paths",
-	]);
+	const supportsJSONFormat = await getExecOutput("nix", ["path-info", "--help"], {
+		ignoreReturnCode: true,
+		silent: true,
+	}).then(({ stdout }) => stdout.includes("--json-format"));
+
+	let paths = [];
+
+	if (supportsJSONFormat) {
+		const { stdout } = await getExecOutput("nix", ["path-info", "--all", "--json", "--json-format", "2"], {
+			silent: true,
+		});
+		const data = JSON.parse(stdout) as { info: Record<string, unknown>; storeDir: string };
+		paths = Object.keys(data.info).map((k) => `${data.storeDir}/${k}`);
+	} else {
+		const { stdout } = await getExecOutput("nix", ["path-info", "--all", "--json"], { silent: true });
+		const data = JSON.parse(stdout) as { path: string }[];
+		paths = data.map((drv) => drv.path);
+	}
+
+	await writeFile(STORE_PATHS, paths.join("\n"));
 };
 
 export const getStorePaths = async () => {
-	const raw = JSON.parse(
-		await readFile(`${process.env["RUNNER_TEMP"] || "/tmp"}/attic-action-store-paths`, "utf8"),
-	) as {
-		info: Record<string, unknown>;
-		storeDir: string;
-	};
-
-	return Object.keys(raw.info).map((k) => `${raw.storeDir}/${k}`);
+	return readFile(STORE_PATHS, { encoding: "utf8" }).then((raw) => raw.split("\n").filter(Boolean));
 };
 
 export const getPostBuildHookPaths = async () => {
