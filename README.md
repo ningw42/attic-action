@@ -58,6 +58,8 @@ Hook setup probes the active Nix store for client trust. If the store explicitly
 >
 > Attic installs its collector through `NIX_CONFIG`, which takes precedence over config files. A hook installed **later through a config file** (for example, through `NIX_USER_CONF_FILES`) is shadowed while the Attic overlay remains active: that later hook is not called or chained. This ordering does not bypass Attic; it silently drops the later hook.
 
+Chained hooks run directly first. If the operating system reports an executable-format error (`ENOEXEC`, for example a script with whitespace before its shebang), Attic retries it with `/bin/sh`, matching Nix's `execvp` shell fallback. Arguments and environment are preserved; missing or non-executable hooks still fail, and the final hook result is propagated after recording captures and diagnostics.
+
 Preserve the inherited `NIX_CONFIG` when adding settings after setup:
 
 - A build step with its own `env: NIX_CONFIG` replaces the inherited value **for that step only**, bypassing Attic capture for its builds unless the collector setting is preserved.
