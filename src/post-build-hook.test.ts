@@ -307,7 +307,7 @@ syncBuiltinESMExports();
 	});
 
 	for (const spawnErrors of [[], ["ENOEXEC"]]) {
-		describe(spawnErrors.length ? "ENOEXEC shell fallback" : "direct execution", () => {
+		describe(spawnErrors.length ? "forced ENOEXEC shell fallback" : "native spawn", () => {
 			test("malformed-header hook forwards literal arguments, OUT_PATHS and stdio", () => {
 				useHook(
 					"cachix's hook $(exit 99).sh",
