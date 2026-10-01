@@ -93,7 +93,13 @@ export const getPostBuildHookPaths = async () => {
 	for (const entry of entries) {
 		if (!entry.startsWith("paths.")) continue;
 
-		const content = await readFile(join(state.pathsDir, entry), "utf8");
+		let content: string;
+		try {
+			content = await readFile(join(state.pathsDir, entry), "utf8");
+		} catch (error) {
+			core.warning(`Skipping unreadable post-build hook capture file ${entry}: ${error}`);
+			continue;
+		}
 		for (const line of content.split(/\r?\n/)) {
 			const path = line.trim();
 			if (path !== "") paths.add(path);
@@ -170,65 +176,104 @@ export const summarizeHookEvent = (event: HookEventRecord, index: number): strin
 	return parts.join("\n");
 };
 
-export const printPostBuildHookCaptureLog = async () => {
-	const { eventsLog } = getPostBuildHookState();
+export const printPostBuildHookCaptureLog = async () =>
+	core.group("Attic post-build hook capture log", async () => {
+		const { eventsLog } = getPostBuildHookState();
 
-	core.startGroup("Attic post-build hook capture log");
+		const emptyMessage =
+			"No hook invocations were captured. This can be normal when nothing was built locally (outputs already existed or were substituted). It can also mean an untrusted daemon client ignored the hook, or NIX_CONFIG was replaced for a build step or later steps. Check the workflow configuration if local builds were expected.";
 
-	const emptyMessage =
-		"No hook invocations were captured. This usually means no new paths were built (e.g. all outputs were already in the store or fetched from a substituter), or less commonly that the collector was not installed in Nix's active config.";
-
-	if (!eventsLog || !(await exists(eventsLog))) {
-		core.warning(emptyMessage);
-		core.endGroup();
-		return;
-	}
-
-	const content = await readFile(eventsLog, "utf8");
-	const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
-
-	if (lines.length === 0) {
-		core.warning(emptyMessage);
-		core.endGroup();
-		return;
-	}
-
-	const events: HookEventRecord[] = [];
-	const malformed: string[] = [];
-	for (const line of lines) {
-		try {
-			const event: unknown = JSON.parse(line);
-			if (isHookEventRecord(event)) events.push(event);
-			else malformed.push(line);
-		} catch {
-			malformed.push(line);
+		if (!eventsLog || !(await exists(eventsLog))) {
+			core.info(emptyMessage);
+			return;
 		}
-	}
 
-	const totalPaths = events.reduce((sum, e) => sum + (e.paths?.length ?? 0), 0);
-	core.info(`Captured ${events.length} hook invocation(s); ${totalPaths} path(s) reported by Nix.`);
+		const content = await readFile(eventsLog, "utf8");
+		const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
 
-	for (let i = 0; i < events.length; i++) {
-		core.info(summarizeHookEvent(events[i]!, i));
-	}
+		if (lines.length === 0) {
+			core.info(emptyMessage);
+			return;
+		}
 
-	if (malformed.length > 0) {
-		core.warning(`Ignored ${malformed.length} malformed event log line(s).`);
+		const events: HookEventRecord[] = [];
+		const malformed: string[] = [];
+		for (const line of lines) {
+			try {
+				const event: unknown = JSON.parse(line);
+				if (isHookEventRecord(event)) events.push(event);
+				else malformed.push(line);
+			} catch {
+				malformed.push(line);
+			}
+		}
+
+		const totalPaths = events.reduce((sum, e) => sum + (e.paths?.length ?? 0), 0);
+		core.info(`Captured ${events.length} hook invocation(s); ${totalPaths} path(s) reported by Nix.`);
+
+		for (let i = 0; i < events.length; i++) {
+			core.info(summarizeHookEvent(events[i]!, i));
+		}
+
+		const captureFailures = events.filter((event) => event.error).length;
+		const chainedFailures = events.filter(
+			({ chained }) =>
+				chained && (chained.error || chained.signal || (typeof chained.status === "number" && chained.status !== 0)),
+		).length;
+		if (captureFailures > 0) {
+			core.warning(
+				`${captureFailures} post-build hook invocation(s) failed to capture output paths. Some locally built outputs may not be pushed.`,
+			);
+		}
+		if (chainedFailures > 0) {
+			core.warning(
+				`${chainedFailures} chained post-build hook invocation(s) failed. These are build-hook failures, not capture losses.`,
+			);
+		}
+
+		if (malformed.length > 0) {
+			core.warning(`Ignored ${malformed.length} malformed event log line(s).`);
+			if (core.isDebug()) {
+				for (const line of malformed) core.debug(`malformed line: ${line}`);
+			}
+		}
+
 		if (core.isDebug()) {
-			for (const line of malformed) core.debug(`malformed line: ${line}`);
+			core.debug(content.trimEnd());
 		}
-	}
+	});
 
-	if (core.isDebug()) {
-		core.startGroup("Raw event log (JSONL)");
-		core.debug(content.trimEnd());
-		core.endGroup();
+const checkPostBuildHookTrust = async () => {
+	let trusted: boolean | undefined;
+	try {
+		// ping works on Nix and Lix; config show does not check daemon permissions.
+		const result = await getExecOutput(
+			"nix",
+			["--extra-experimental-features", "nix-command", "store", "ping", "--json"],
+			{ ignoreReturnCode: true, silent: true },
+		);
+		// Nonzero probes sometimes print partial JSON: never trust that data.
+		if (result.exitCode === 0) {
+			const value: unknown = JSON.parse(result.stdout);
+			if (isRecord(value) && typeof value["trusted"] === "boolean") trusted = value["trusted"];
+		}
+	} catch {
+		// Missing commands, connection errors and malformed JSON are unknown.
 	}
-
-	core.endGroup();
+	if (trusted === false) {
+		throw new Error(
+			"Cannot use post-build-hook: the Nix store reports trusted=false for this client. Configure a trusted workflow user or explicitly select path-discovery-mode: store-scan.",
+		);
+	}
+	if (trusted === undefined) {
+		core.warning(
+			"Unable to determine Nix store trust; continuing post-build-hook setup. The daemon may ignore the hook, so captures may be missing.",
+		);
+	}
 };
 
 export const configurePostBuildHookPathDiscovery = async () => {
+	await checkPostBuildHookTrust();
 	// Ask Nix after attic use has updated the configuration; don't guess which
 	// config source wins or resurrect an inactive hook from another action.
 	const originalHook = await currentPostBuildHook();
@@ -236,7 +281,8 @@ export const configurePostBuildHookPathDiscovery = async () => {
 	const stateDir = await mkdtemp(join(runnerTemp, "attic-action-post-build-hook-"));
 	const pathsDir = join(stateDir, "paths");
 	const eventsLog = join(stateDir, "events.log");
-	const wrapper = join(stateDir, "post-build-hook.js");
+	const shim = join(stateDir, "post-build-hook.cjs");
+	const wrapper = join(stateDir, "post-build-hook.sh");
 
 	// The runner owns these private directories. Root can write through them,
 	// but unrelated UIDs cannot inject captures even in a traversable RUNNER_TEMP.
@@ -245,7 +291,13 @@ export const configurePostBuildHookPathDiscovery = async () => {
 	await chmod(pathsDir, 0o700);
 	await writeFile(eventsLog, "", { mode: 0o600 });
 	await chmod(eventsLog, 0o600);
-	await writeFile(wrapper, postBuildHookScript({ pathsDir, eventsLog, wrapper, originalHook }), { mode: 0o700 });
+	await writeFile(shim, postBuildHookScript({ pathsDir, eventsLog, originalHook }), { mode: 0o600 });
+	await chmod(shim, 0o600);
+	await writeFile(
+		wrapper,
+		`#!/bin/sh\nexec ${quoteShellArgument(process.execPath)} ${quoteShellArgument(shim)} "$@"\n`,
+		{ mode: 0o700 },
+	);
 	await chmod(wrapper, 0o700);
 
 	savePostBuildHookState({ pathsDir, eventsLog });
@@ -260,7 +312,7 @@ export const configurePostBuildHookPathDiscovery = async () => {
 	if (originalHook) {
 		core.info(`Composing with existing post-build hook: ${originalHook}`);
 	} else {
-		core.warning("No existing post-build hook found");
+		core.info("No existing post-build hook found");
 	}
 };
 
@@ -270,8 +322,9 @@ const savePostBuildHookState = ({ pathsDir, eventsLog }: PostBuildHookState) => 
 };
 
 const getPostBuildHookState = (): Partial<PostBuildHookState> => ({
-	pathsDir: core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-paths-dir`) || process.env["ATTIC_POST_BUILD_PATHS_DIR"],
-	eventsLog: core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-events-log`) || process.env["ATTIC_POST_BUILD_EVENTS_LOG"],
+	// Job-wide exports can belong to another instance if this setup failed.
+	pathsDir: core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-paths-dir`),
+	eventsLog: core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-events-log`),
 });
 
 export const currentPostBuildHook = async (): Promise<string> => {
@@ -297,28 +350,14 @@ export const currentPostBuildHook = async (): Promise<string> => {
 	return setting["value"];
 };
 
-// The wrapper installed into Nix's `post-build-hook` is a tiny Node shim
-// that requires the bundled `dist/post-build-hook.js` and invokes it with
-// the absolute paths baked in. We do this instead of relying on environment
-// variables because the nix-daemon strips/normalizes the env it passes to
-// hooks. Bundling lets us write the hook in TypeScript with the same
-// toolchain as the rest of the action while keeping the runtime artifact
-// fully self-contained (no `node_modules` lookup at hook time).
-export const postBuildHookScript = (state: HookConfig) => {
-	// `__dirname` is defined in the bundled CJS output (`dist/index.js`) and
-	// resolves to the dist directory at runtime, so the sibling bundle
-	// `post-build-hook.js` is discoverable. When loaded as ESM (e.g. tests),
-	// fall back to `import.meta.url`-derived path.
-	const here = typeof __dirname !== "undefined" ? __dirname : new URL(".", import.meta.url).pathname;
-	const bundlePath = join(here, "post-build-hook.js");
-	const config = JSON.stringify(state);
-	// Bake in the absolute path to the node binary running the action rather
-	// than relying on `/usr/bin/env node`. On macOS the nix-daemon is launched
-	// by launchd with a minimal PATH that does not include the node installed
-	// by `actions/setup-node`, so a PATH lookup fails with ENOENT.
-	return `#!${process.execPath}
-require(${JSON.stringify(bundlePath)}).runHook(${config});
-`;
+// Use an absolute shell interpreter and quoted executable paths: the daemon
+// need not have Node on PATH, and the executable may contain spaces/quotes.
+const quoteShellArgument = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+
+const postBuildHookScript = (state: HookConfig) => {
+	// This action is bundled as CJS. Packaged tests exercise the same resolution.
+	const bundlePath = join(__dirname, "post-build-hook.js");
+	return `require(${JSON.stringify(bundlePath)}).runHook(${JSON.stringify(state)});\n`;
 };
 
 const exists = async (path: string) => {

@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, accessSync, constants } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +9,6 @@ import {
 	applyPathFilters,
 	excludeTemporaryPaths,
 	getPostBuildHookPaths,
-	postBuildHookScript,
 	summarizeHookEvent,
 	type HookEventRecord,
 } from "./utils.ts";
@@ -180,23 +179,29 @@ describe("printPostBuildHookCaptureLog", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	const run = () =>
+	const run = (env: Record<string, string | undefined> = {}) =>
 		runPrintInSubprocess({
 			RUNNER_TEMP: root,
-			ATTIC_POST_BUILD_EVENTS_LOG: join(root, "events.log"),
+			"STATE_post_build_hook-events-log": join(root, "events.log"),
+			...env,
 		});
 
-	test("missing events.log → warning, no throw", () => {
+	test("missing events.log explains normal and possible misconfiguration causes without warning", () => {
 		const result = run();
 		assert.equal(result.status, 0, `stderr=${result.stderr}`);
-		assert.match(result.stdout, /::warning::No hook invocations were captured/);
+		assert.match(result.stdout, /No hook invocations were captured/);
+		assert.match(result.stdout, /nothing was built locally/);
+		assert.match(result.stdout, /untrusted daemon client/);
+		assert.match(result.stdout, /NIX_CONFIG/);
+		assert.doesNotMatch(result.stdout, /::warning::/);
 	});
 
-	test("empty events.log → warning", () => {
+	test("empty events.log is informational", () => {
 		writeFileSync(join(root, "events.log"), "");
 		const result = run();
 		assert.equal(result.status, 0, `stderr=${result.stderr}`);
-		assert.match(result.stdout, /::warning::No hook invocations were captured/);
+		assert.match(result.stdout, /No hook invocations were captured/);
+		assert.doesNotMatch(result.stdout, /::warning::/);
 	});
 
 	test("multi-event log: summary totals correct", () => {
@@ -246,6 +251,39 @@ describe("printPostBuildHookCaptureLog", () => {
 		assert.match(result.stdout, /Ignored 19 malformed event log line\(s\)/);
 	});
 
+	test("capture and chained-hook failures have separate counted warning annotations", () => {
+		const records = [
+			{ paths: ["/nix/store/lost"], error: { message: "ENOENT: paths directory removed" } },
+			{ paths: ["/nix/store/good"], chained: { hook: "/orig", status: 42 } },
+			{ chained: { hook: "/orig", status: null, signal: "SIGTERM" } },
+			{ chained: { hook: "/missing", status: null, error: "ENOENT" } },
+			{ chained: { hook: "/ok", status: 0 } },
+		];
+		writeFileSync(join(root, "events.log"), records.map((record) => JSON.stringify(record)).join("\n"));
+		const result = run();
+		assert.equal(result.status, 0, result.stderr);
+		const warnings = result.stdout.split("\n").filter((line) => line.startsWith("::warning::"));
+		assert.equal(warnings.length, 2, result.stdout);
+		assert.match(warnings[0]!, /1 post-build hook invocation\(s\) failed to capture output paths/);
+		assert.match(warnings[1]!, /3 chained post-build hook invocation\(s\) failed/);
+	});
+
+	test("debug output is flat and diagnostics groups close even on read errors", () => {
+		writeFileSync(join(root, "events.log"), '{"paths":[]}\nnot-json\n');
+		const debug = run({ RUNNER_DEBUG: "1" });
+		assert.equal(debug.status, 0, debug.stderr);
+		assert.deepEqual(
+			debug.stdout.split("\n").filter((line) => /^::(?:group|endgroup)::/.test(line)),
+			["::group::Attic post-build hook capture log", "::endgroup::"],
+		);
+		const unreadable = run({ "STATE_post_build_hook-events-log": root });
+		assert.equal(unreadable.status, 1);
+		assert.deepEqual(
+			unreadable.stdout.split("\n").filter((line) => /^::(?:group|endgroup)::/.test(line)),
+			["::group::Attic post-build hook capture log", "::endgroup::"],
+		);
+	});
+
 	test("malformed lines tolerated, warning emitted", () => {
 		const log = [
 			JSON.stringify({ ts: "t1", pid: 1, paths: ["/nix/store/a"] }),
@@ -262,50 +300,6 @@ describe("printPostBuildHookCaptureLog", () => {
 	});
 });
 
-describe("postBuildHookScript (wrapper shebang)", () => {
-	test("has absolute shebang pointing at executable node", () => {
-		const script = postBuildHookScript({
-			pathsDir: "/x/paths",
-			eventsLog: "/x/events.log",
-			wrapper: "/x/wrapper.js",
-			originalHook: "",
-		});
-
-		const firstLine = script.split("\n")[0]!;
-		assert.match(firstLine, /^#!\//, "shebang must be absolute");
-
-		const shebangPath = firstLine.slice(2).trim();
-		assert.doesNotThrow(() => accessSync(shebangPath, constants.X_OK), `${shebangPath} not executable`);
-	});
-
-	test("embeds config as JSON in require call", () => {
-		const config = {
-			pathsDir: "/x/paths",
-			eventsLog: "/x/events.log",
-			wrapper: "/x/wrapper.js",
-			originalHook: "/some/orig.sh",
-		};
-		const script = postBuildHookScript(config);
-		// Extract and parse the JSON argument to runHook(...)
-		const match = script.match(/runHook\((\{.+\})\);/s);
-		assert.ok(match, "must contain runHook(...) call");
-		const parsed = JSON.parse(match![1]!);
-		assert.deepEqual(parsed, config);
-	});
-
-	test("shebang path tolerates spaces in config values (uses JSON.stringify)", () => {
-		const script = postBuildHookScript({
-			pathsDir: "/x/with spaces",
-			eventsLog: "/x/with 'quotes'/events.log",
-			wrapper: "/x/wrapper.js",
-			originalHook: '/orig "weird".sh',
-		});
-		const match = script.match(/runHook\((\{.+\})\);/s);
-		assert.ok(match);
-		assert.deepEqual(JSON.parse(match![1]!).originalHook, '/orig "weird".sh');
-	});
-});
-
 describe("getPostBuildHookPaths (round-trip with hook output)", () => {
 	const { setEnv, restoreEnv } = createTestEnv();
 	let root: string;
@@ -316,7 +310,7 @@ describe("getPostBuildHookPaths (round-trip with hook output)", () => {
 		pathsDir = join(root, "paths");
 		mkdirSync(pathsDir, { recursive: true });
 		// Point the state-lookup at our temp dir.
-		setEnv("ATTIC_POST_BUILD_PATHS_DIR", pathsDir);
+		setEnv("STATE_post_build_hook-paths-dir", pathsDir);
 	});
 
 	afterEach(() => {
@@ -341,7 +335,7 @@ describe("getPostBuildHookPaths (round-trip with hook output)", () => {
 	});
 
 	test("missing paths dir → empty array (no throw)", async () => {
-		setEnv("ATTIC_POST_BUILD_PATHS_DIR", join(root, "does-not-exist"));
+		setEnv("STATE_post_build_hook-paths-dir", join(root, "does-not-exist"));
 		assert.deepEqual(await getPostBuildHookPaths(), []);
 	});
 

@@ -13,7 +13,25 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
-import { describe, test, type TestContext } from "node:test";
+import { after, before, describe, test, type TestContext } from "node:test";
+import { fileURLToPath } from "node:url";
+import { buildSync } from "esbuild";
+
+// Exercise the same CommonJS directory layout as the shipped action. In
+// particular, shim generation must resolve the sibling hook bundle via __dirname.
+const bundleDir = mkdtempSync(join(tmpdir(), "attic-nix-config-runtime-"));
+before(() => {
+	writeFileSync(join(bundleDir, "package.json"), JSON.stringify({ type: "commonjs" }));
+	buildSync({
+		entryPoints: ["utils.ts", "post-build-hook.ts"].map((name) => fileURLToPath(new URL(name, import.meta.url))),
+		outdir: bundleDir,
+		bundle: true,
+		platform: "node",
+		format: "cjs",
+		logLevel: "silent",
+	});
+});
+after(() => rmSync(bundleDir, { recursive: true, force: true }));
 
 const resolveNix = (): string | undefined => {
 	const override = process.env["ATTIC_TEST_NIX"];
@@ -44,6 +62,7 @@ type SetupResult = {
 	currentHook: unknown;
 	installedHook: unknown;
 	env: NodeJS.ProcessEnv;
+	stdout: string;
 };
 
 const fixture = (t: TestContext) => {
@@ -84,6 +103,9 @@ const fixture = (t: TestContext) => {
 		XDG_CACHE_HOME: join(root, "cache"),
 		XDG_DATA_HOME: join(root, "data"),
 		NIX_CONF_DIR: dirname(systemConfig),
+		// Config-only cases cannot contact the host daemon or open the host store.
+		// The trust probe is unknown unless a test selects its own local store.
+		NIX_REMOTE: `unix://${join(root, "no-daemon.sock")}`,
 		TMPDIR: root,
 		RUNNER_TEMP: runnerTemp,
 		GITHUB_ENV: githubEnv,
@@ -124,17 +146,19 @@ const fixture = (t: TestContext) => {
 		writeFileSync(githubEnv, "");
 		writeFileSync(githubState, "");
 		const driver = `
-			import { writeFileSync } from "node:fs";
+			const { writeFileSync } = require("node:fs");
 			const { currentPostBuildHook, configurePostBuildHookPathDiscovery } =
-				await import(${JSON.stringify(new URL("./utils.ts", import.meta.url).href)});
-			const currentHook = await currentPostBuildHook();
-			await configurePostBuildHookPathDiscovery();
-			const installedHook = await currentPostBuildHook();
-			writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({ currentHook, installedHook, env: process.env }));
+				require(${JSON.stringify(join(bundleDir, "utils.js"))});
+			(async () => {
+				const currentHook = await currentPostBuildHook();
+				await configurePostBuildHookPathDiscovery();
+				const installedHook = await currentPostBuildHook();
+				writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({ currentHook, installedHook, env: process.env }));
+			})().catch((error) => { console.error(error); process.exitCode = 1; });
 		`;
 		// Keep @actions/core output inside the child, away from node:test's reporter.
-		run(process.execPath, ["--input-type=module", "-e", driver]);
-		return JSON.parse(readFileSync(resultFile, "utf8")) as SetupResult;
+		const stdout = run(process.execPath, ["--input-type=commonjs", "-e", driver]);
+		return { ...(JSON.parse(readFileSync(resultFile, "utf8")) as Omit<SetupResult, "stdout">), stdout };
 	};
 
 	const hook = (name: string) => {
@@ -156,6 +180,8 @@ const fixture = (t: TestContext) => {
 		effectiveSettings,
 		configure,
 		hook,
+		pingStore: () => run(nixExecutable, ["--extra-experimental-features", "nix-command", "store", "ping", "--json"]),
+		capture: (launcher: string, outPaths: string) => run(launcher, [], { OUT_PATHS: outPaths }),
 	};
 };
 
@@ -176,15 +202,20 @@ const assertSetup = (f: Fixture, before: Record<string, unknown>, result: SetupR
 	assert.ok(pathsDir && isAbsolute(pathsDir));
 	assert.ok(eventsLog && isAbsolute(eventsLog));
 	const stateDir = dirname(pathsDir);
-	const wrapper = join(stateDir, "post-build-hook.js");
+	const launcher = join(stateDir, "post-build-hook.sh");
+	const shimPath = join(stateDir, "post-build-hook.cjs");
 	assert.equal(dirname(stateDir), f.runnerTemp);
-	assert.equal(statSync(stateDir).mode & 0o777, 0o700, "hook state must be private to the runner");
+	assert.equal(statSync(stateDir).mode & 0o7777, 0o700, "hook state must be private to the runner");
 	assert.ok(statSync(pathsDir).isDirectory());
+	assert.equal(statSync(pathsDir).mode & 0o7777, 0o700);
 	assert.ok(statSync(eventsLog).isFile());
+	assert.equal(statSync(eventsLog).mode & 0o7777, 0o600);
 	assert.equal(dirname(eventsLog), stateDir);
-	accessSync(wrapper, constants.X_OK);
-	assert.equal(installedHook, wrapper, "Nix must actually select the generated wrapper");
-	assert.equal(result.installedHook, wrapper);
+	accessSync(launcher, constants.X_OK);
+	assert.equal(statSync(launcher).mode & 0o7777, 0o700);
+	assert.equal(statSync(shimPath).mode & 0o7777, 0o600);
+	assert.equal(installedHook, launcher, "Nix must actually select the generated shell launcher");
+	assert.equal(result.installedHook, launcher);
 	assert.equal(result.env["NIX_USER_CONF_FILES"], f.env["NIX_USER_CONF_FILES"], "do not replace user config discovery");
 	assert.equal(result.env["ATTIC_POST_BUILD_HOOK"], undefined);
 	assert.equal(result.env["ATTIC_ORIGINAL_POST_BUILD_HOOK"], undefined);
@@ -200,18 +231,18 @@ const assertSetup = (f: Fixture, before: Record<string, unknown>, result: SetupR
 		!oldInline || oldInline.endsWith("\n") || appended.startsWith("\n"),
 		"separate the appended setting with a newline",
 	);
-	assert.equal(appended.trim(), `post-build-hook = ${wrapper}`, "append exactly one hook setting to NIX_CONFIG");
+	assert.equal(appended.trim(), `post-build-hook = ${launcher}`, "append exactly one hook setting to NIX_CONFIG");
 
 	const exports = Array.from(readFileSync(f.githubEnv, "utf8").matchAll(/^([A-Z_][A-Z_0-9]*)<</gm), ([, name]) => name);
 	assert.deepEqual(exports.sort(), ["ATTIC_POST_BUILD_EVENTS_LOG", "ATTIC_POST_BUILD_PATHS_DIR", "NIX_CONFIG"]);
 
 	// Inspect the actual generated shim, not postBuildHookScript directly: the
 	// daemon must receive the effective original hook in its baked configuration.
-	const shim = readFileSync(wrapper, "utf8");
+	const shim = readFileSync(shimPath, "utf8");
 	const match = shim.match(/runHook\((\{.+\})\);/s);
-	assert.ok(match, "generated wrapper must pass baked JSON to runHook");
+	assert.ok(match, "generated CommonJS shim must pass baked JSON to runHook");
 	const baked = JSON.parse(match[1]!);
-	assert.deepEqual(baked, { pathsDir, eventsLog, wrapper, originalHook: previousHook });
+	assert.deepEqual(baked, { pathsDir, eventsLog, originalHook: previousHook });
 	return stateDir;
 };
 
@@ -342,14 +373,87 @@ describe(
 			checkConfiguration(f, "");
 		});
 
+		test("inherited NIX_CONFIG shadows later file hooks; a step replacement affects only that environment", (t) => {
+			const f = fixture(t);
+			const result = f.configure();
+			const laterHook = f.hook("later-file-hook");
+			const laterConfig = join(f.root, "later.conf");
+			writeFileSync(laterConfig, f.cacheConfig + "post-build-hook = " + laterHook + "\n");
+			const inherited = { ...result.env, NIX_USER_CONF_FILES: laterConfig };
+			assert.equal(f.effectiveSettings(inherited)["post-build-hook"], result.installedHook);
+			const stepOverride = { ...inherited, NIX_CONFIG: "keep-going = true" };
+			assert.equal(f.effectiveSettings(stepOverride)["post-build-hook"], laterHook);
+			assert.equal(
+				f.effectiveSettings(inherited)["post-build-hook"],
+				result.installedHook,
+				"the next step inheriting the original export still uses the collector",
+			);
+		});
+
+		test("the documented shell append keeps inherited settings and the collector", (t) => {
+			const f = fixture(t);
+			const result = f.configure();
+			const script =
+				'export NIX_CONFIG="${NIX_CONFIG:-}\n${EXTRA_NIX_CONFIG:-}"\nexec nix --extra-experimental-features nix-command show-config --json';
+			const appended = spawnSync("/bin/sh", ["-c", script], {
+				env: { ...result.env, EXTRA_NIX_CONFIG: "keep-going = true" },
+				encoding: "utf8",
+			});
+			assert.equal(appended.status, 0, appended.stderr);
+			const settings = JSON.parse(appended.stdout);
+			assert.equal(settings["post-build-hook"].value, result.installedHook);
+			assert.deepEqual(settings["substituters"].value, [cache]);
+			assert.deepEqual(settings["trusted-public-keys"].value, [publicKey]);
+			assert.equal(settings["netrc-file"].value, f.netrc);
+			assert.equal(settings["keep-going"].value, true);
+		});
+
+		test("a trusted direct local store preserves configuration and installs a working collector", (t) => {
+			const f = fixture(t);
+			const storeRoot = join(f.root, "local-store");
+			f.env["NIX_REMOTE"] = `local?root=${storeRoot}`;
+			writeFileSync(f.systemConfig, "build-users-group =\n");
+
+			const pingOutput = f.pingStore();
+			t.diagnostic(`Direct local store ping stdout: ${pingOutput.trim()}`);
+			assert.equal(JSON.parse(pingOutput).trusted, true, "real local store must report boolean trusted: true");
+			assert.ok(statSync(join(storeRoot, "nix", "var", "nix", "db", "db.sqlite")).isFile());
+
+			const before = f.effectiveSettings();
+			assertCacheSettings(f, before);
+			assert.equal(before["build-users-group"], "");
+			assert.equal(before["post-build-hook"], "");
+			const result = f.configure();
+			t.diagnostic(
+				`Effective local settings: ${JSON.stringify({
+					"build-users-group": before["build-users-group"],
+					"post-build-hook-before": before["post-build-hook"],
+					"post-build-hook-after": f.effectiveSettings(result.env)["post-build-hook"],
+				})}`,
+			);
+			assertSetup(f, before, result);
+			assert.doesNotMatch(result.stdout, /::warning::/, "trusted local setup without an existing hook is normal");
+
+			assert.equal(typeof result.installedHook, "string");
+			f.capture(result.installedHook as string, "/nix/store/local-capture");
+			const event = JSON.parse(readFileSync(result.env["ATTIC_POST_BUILD_EVENTS_LOG"]!, "utf8"));
+			assert.deepEqual(event.paths, ["/nix/store/local-capture"]);
+			assert.equal(readFileSync(event.pathsFile, "utf8"), "/nix/store/local-capture\n");
+			assert.equal(event.error, undefined);
+			assert.equal(event.chained, null);
+		});
+
 		test("separate setups sharing RUNNER_TEMP get distinct private state directories", (t) => {
 			const f = fixture(t);
 			const firstStateDir = checkConfiguration(f, "");
-			const firstWrapper = join(firstStateDir, "post-build-hook.js");
-			const originalShim = readFileSync(firstWrapper, "utf8");
+			const firstLauncher = join(firstStateDir, "post-build-hook.sh");
+			const firstShim = join(firstStateDir, "post-build-hook.cjs");
+			const originalLauncher = readFileSync(firstLauncher, "utf8");
+			const originalShim = readFileSync(firstShim, "utf8");
 			const secondStateDir = checkConfiguration(f, "");
 			assert.notEqual(secondStateDir, firstStateDir, "a later action must not overwrite an earlier collector");
-			assert.equal(readFileSync(firstWrapper, "utf8"), originalShim);
+			assert.equal(readFileSync(firstLauncher, "utf8"), originalLauncher);
+			assert.equal(readFileSync(firstShim, "utf8"), originalShim);
 		});
 	},
 );

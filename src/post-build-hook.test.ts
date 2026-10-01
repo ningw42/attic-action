@@ -13,10 +13,9 @@ const setup = () => {
 	const root = mkdtempSync(join(tmpdir(), "attic-hook-test-"));
 	const pathsDir = join(root, "paths");
 	const eventsLog = join(root, "events.log");
-	const wrapper = join(root, "wrapper.js");
 	mkdirSync(pathsDir, { mode: 0o700 });
 	writeFileSync(eventsLog, "", { mode: 0o600 });
-	const config: HookConfig = { pathsDir, eventsLog, wrapper, originalHook: "" };
+	const config: HookConfig = { pathsDir, eventsLog, originalHook: "" };
 	return { root, config };
 };
 
@@ -257,23 +256,6 @@ describe("runHook (subprocess)", () => {
 		assert.equal(readFileSync(event.pathsFile, "utf8"), "/nix/store/x\n");
 		return event;
 	};
-
-	test("recursion guard records paths and an error, then fails without executing the wrapper", () => {
-		const marker = join(root, "recursive-marker");
-		writeFileSync(config.wrapper, `#!/usr/bin/env bash\nprintf called > ${JSON.stringify(marker)}\n`, {
-			mode: 0o755,
-		});
-		chmodSync(config.wrapper, 0o755);
-		config.originalHook = config.wrapper;
-
-		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
-		const event = readCapturedEvent();
-		assert.equal(event.chained?.hook, config.wrapper);
-		assert.equal(event.chained?.status, null);
-		assert.match(event.chained?.error ?? "", /recursion/);
-		assert.throws(() => statSync(marker), { code: "ENOENT" });
-		assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
-	});
 
 	test("missing original hook records paths and a spawn error, then fails", () => {
 		config.originalHook = join(root, "does-not-exist");

@@ -15,7 +15,6 @@ import { join } from "node:path";
 export type HookConfig = {
 	pathsDir: string;
 	eventsLog: string;
-	wrapper: string;
 	originalHook: string;
 };
 
@@ -80,15 +79,6 @@ const recordOutPaths = (config: HookConfig, event: HookEvent): void => {
 const chainOriginalHook = (config: HookConfig, event: HookEvent): void => {
 	if (!config.originalHook) return;
 
-	if (config.originalHook === config.wrapper) {
-		event.chained = {
-			hook: config.originalHook,
-			status: null,
-			error: "original hook points to this wrapper; skipping to avoid recursion",
-		};
-		return;
-	}
-
 	const result = spawnSync(config.originalHook, process.argv.slice(2), {
 		stdio: "inherit",
 		env: process.env,
@@ -125,8 +115,8 @@ export const runHook = (config: HookConfig) => {
 	chainOriginalHook(config, event);
 	writeEvent(config, event);
 
-	// Spawn failures and recursive configurations are failures too, but only
-	// terminate after the paths and the chained-hook diagnostics are recorded.
+	// Treat spawn errors as failures, but only terminate after recording the
+	// paths and the chained-hook diagnostics.
 	if (event.chained?.error) process.exit(1);
 
 	if (event.chained?.signal) {
