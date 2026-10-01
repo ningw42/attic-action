@@ -253,6 +253,7 @@ else process.exit(process.env.TEST_CHAIN === "nonzero" ? 7 : 0);`,
 	if (options.originalHook === "malformed-header") {
 		originalHook = join(bin, "cachix's post-build-hook.sh");
 		// Cachix generates a leading newline and indentation before its shebang.
+		// This wrapper delegates to the original-hook executable created above.
 		// Exercise this via the generated launcher and bundled collector on macOS.
 		writeFileSync(originalHook, '\n    #!/usr/bin/env bash\n    set -eu\n    exec original-hook "$@"\n', {
 			mode: 0o755,
@@ -432,7 +433,7 @@ test("default post-build-hook pushes unique filtered outputs without warnings, a
 });
 
 for (const originalHook of ["success", "malformed-header"] as const) {
-	test(`an explicitly configured ${originalHook} hook is still chained with its arguments and outputs`, (t) => {
+	test(`an explicitly configured original hook (${originalHook}) is still chained with its arguments and outputs`, (t) => {
 		const f = fixture(t, "post-build-hook", { originalHook });
 		assert.match(f.setup(), /Composing with existing post-build hook:/);
 		const args = ["one argument", "", "it's literal; $(exit 99) *", "--flag"];

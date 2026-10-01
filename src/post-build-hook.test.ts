@@ -229,6 +229,13 @@ describe("runHook (subprocess)", () => {
 		cleanup(root);
 	});
 
+	const useHook = (name: string, source: string, mode = 0o755) => {
+		config.originalHook = join(root, name);
+		writeFileSync(config.originalHook, source);
+		chmodSync(config.originalHook, mode);
+		return config.originalHook;
+	};
+
 	const runInSubprocess = (
 		env: Record<string, string>,
 		{ umask, args = [], spawnErrors = [] }: { umask?: number; args?: string[]; spawnErrors?: string[] } = {},
@@ -237,7 +244,7 @@ describe("runHook (subprocess)", () => {
 		// Linux masks malformed executable headers with its own shell fallback.
 		// Inject errors only at the OS boundary, inside the isolated child process;
 		// once exhausted, the retry executes a real shell and hook.
-		const injectSpawnErrors = spawnErrors.length
+		const spawnErrorPreamble = spawnErrors.length
 			? `import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 const realSpawnSync = childProcess.spawnSync;
@@ -255,7 +262,7 @@ syncBuiltinESMExports();
 		const hookModule = new URL("./post-build-hook.ts", import.meta.url).pathname;
 		writeFileSync(
 			driver,
-			`${injectSpawnErrors}import { runHook } from ${JSON.stringify(hookModule)};\n${umask === undefined ? "" : `process.umask(${umask});\n`}runHook(${JSON.stringify(config)});\n`,
+			`${spawnErrorPreamble}import { runHook } from ${JSON.stringify(hookModule)};\n${umask === undefined ? "" : `process.umask(${umask});\n`}runHook(${JSON.stringify(config)});\n`,
 		);
 		const childEnv = { ...process.env, ...env };
 		// An absent NODE_V8_COVERAGE is automatically re-inherited by spawnSync.
@@ -277,27 +284,6 @@ syncBuiltinESMExports();
 		return event;
 	};
 
-	for (const spawnErrors of [[], ["ENOEXEC"]]) {
-		test(`malformed-header hook forwards literal arguments, OUT_PATHS and stdio (${spawnErrors.length ? "forced ENOEXEC" : "native spawn"})`, () => {
-			config.originalHook = join(root, "cachix's hook $(exit 99).sh");
-			writeFileSync(
-				config.originalHook,
-				`\n    #!/usr/bin/env bash\n    set -eu\n    printf '%s\\n' "$OUT_PATHS" "$#" "$@"\n    printf 'chained stderr\\n' >&2\n`,
-				{ mode: 0o755 },
-			);
-			chmodSync(config.originalHook, 0o755);
-			const result = runInSubprocess(
-				{ OUT_PATHS: "/nix/store/x" },
-				{ args: ["two words", "", "it's literal; $(exit 99) *", "--flag"], spawnErrors },
-			);
-
-			assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
-			assert.equal(result.stdout, "/nix/store/x\n4\ntwo words\n\nit's literal; $(exit 99) *\n--flag\n");
-			assert.match(result.stderr, /^chained stderr$/m);
-			assert.deepEqual(readCapturedEvent().chained, { hook: config.originalHook, status: 0, signal: null });
-		});
-	}
-
 	test("missing original hook records paths and a spawn error, then fails", () => {
 		config.originalHook = join(root, "does-not-exist");
 		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
@@ -310,9 +296,7 @@ syncBuiltinESMExports();
 	});
 
 	test("non-executable original hook records paths and a spawn error, then fails", () => {
-		config.originalHook = join(root, "not-executable.sh");
-		writeFileSync(config.originalHook, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o644 });
-		chmodSync(config.originalHook, 0o644);
+		useHook("not-executable.sh", "#!/usr/bin/env bash\nexit 0\n", 0o644);
 		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
 
 		const event = readCapturedEvent();
@@ -324,11 +308,24 @@ syncBuiltinESMExports();
 
 	for (const spawnErrors of [[], ["ENOEXEC"]]) {
 		describe(spawnErrors.length ? "ENOEXEC shell fallback" : "direct execution", () => {
+			test("malformed-header hook forwards literal arguments, OUT_PATHS and stdio", () => {
+				useHook(
+					"cachix's hook $(exit 99).sh",
+					`\n    #!/usr/bin/env bash\n    set -eu\n    printf '%s\\n' "$OUT_PATHS" "$#" "$@"\n    printf 'chained stderr\\n' >&2\n`,
+				);
+				const result = runInSubprocess(
+					{ OUT_PATHS: "/nix/store/x" },
+					{ args: ["two words", "", "it's literal; $(exit 99) *", "--flag"], spawnErrors },
+				);
+
+				assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+				assert.equal(result.stdout, "/nix/store/x\n4\ntwo words\n\nit's literal; $(exit 99) *\n--flag\n");
+				assert.match(result.stderr, /^chained stderr$/m);
+				assert.deepEqual(readCapturedEvent().chained, { hook: config.originalHook, status: 0, signal: null });
+			});
+
 			test("original hook non-zero exit propagates after recording paths and the event", () => {
-				const orig = join(root, "fail.sh");
-				writeFileSync(orig, "#!/usr/bin/env bash\nexit 42\n", { mode: 0o755 });
-				chmodSync(orig, 0o755);
-				config.originalHook = orig;
+				const orig = useHook("fail.sh", "#!/usr/bin/env bash\nexit 42\n");
 
 				const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors });
 				assert.equal(result.status, 42, `stdout=${result.stdout}\nstderr=${result.stderr}`);
@@ -340,10 +337,7 @@ syncBuiltinESMExports();
 
 			for (const signal of ["SIGTERM", "SIGKILL"] as const) {
 				test(`original hook ${signal} termination is propagated after recording paths and the event`, () => {
-					const orig = join(root, "signal.sh");
-					writeFileSync(orig, `#!/usr/bin/env bash\nkill -s ${signal.slice(3)} $$\n`, { mode: 0o755 });
-					chmodSync(orig, 0o755);
-					config.originalHook = orig;
+					const orig = useHook("signal.sh", `#!/usr/bin/env bash\nkill -s ${signal.slice(3)} $$\n`);
 
 					const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors });
 					const event = readCapturedEvent();
@@ -354,10 +348,7 @@ syncBuiltinESMExports();
 			}
 
 			test("original hook SIGPIPE termination stays a failure even though Node ignores SIGPIPE", () => {
-				const orig = join(root, "sigpipe.sh");
-				writeFileSync(orig, "#!/usr/bin/env bash\nkill -s PIPE $$\n", { mode: 0o755 });
-				chmodSync(orig, 0o755);
-				config.originalHook = orig;
+				const orig = useHook("sigpipe.sh", "#!/usr/bin/env bash\nkill -s PIPE $$\n");
 
 				const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors });
 				const event = readCapturedEvent();
@@ -366,10 +357,7 @@ syncBuiltinESMExports();
 			});
 
 			test("restrictive umask leaves capture files readable and is inherited unchanged by the original hook", () => {
-				const orig = join(root, "umask.sh");
-				writeFileSync(orig, "#!/usr/bin/env bash\numask\n", { mode: 0o755 });
-				chmodSync(orig, 0o755);
-				config.originalHook = orig;
+				const orig = useHook("umask.sh", "#!/usr/bin/env bash\numask\n");
 
 				const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { umask: 0o777, spawnErrors });
 				assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
@@ -387,9 +375,7 @@ syncBuiltinESMExports();
 
 	for (const code of ["ENOENT", "ENOEXEC"]) {
 		test(`failed shell spawn records the final ${code} error without another retry`, () => {
-			config.originalHook = join(root, "orig.sh");
-			writeFileSync(config.originalHook, "exit 0\n", { mode: 0o755 });
-			chmodSync(config.originalHook, 0o755);
+			useHook("orig.sh", "exit 0\n");
 			const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors: ["ENOEXEC", code] });
 
 			assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);

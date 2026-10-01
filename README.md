@@ -53,12 +53,12 @@ How to discover store paths to push automatically (**default is `store-scan`**).
 
 Hook setup probes the active Nix store for client trust. If the store explicitly reports that the client is untrusted, setup fails. If trust cannot be determined, setup warns and continues; the daemon might ignore the hook. There is no automatic fallback to `store-scan`.
 
+Chained hooks run directly first. If the operating system reports an executable-format error (`ENOEXEC`, for example a script with whitespace before its shebang), Attic retries it with `/bin/sh`, matching Nix's `execvp` shell fallback. Arguments and environment are preserved; missing or non-executable hooks still fail, and the final hook result is propagated after recording captured paths and diagnostics.
+
 > [!WARNING]
 > Run `attic-action` **after** other hook-installing actions (such as `cachix/cachix-action`) and **before** the builds you want to cache. Nix has a single effective `post-build-hook`; Attic chains the hook that is effective when setup runs.
 >
 > Attic installs its collector through `NIX_CONFIG`, which takes precedence over config files. A hook installed **later through a config file** (for example, through `NIX_USER_CONF_FILES`) is shadowed while the Attic overlay remains active: that later hook is not called or chained. This ordering does not bypass Attic; it silently drops the later hook.
-
-Chained hooks run directly first. If the operating system reports an executable-format error (`ENOEXEC`, for example a script with whitespace before its shebang), Attic retries it with `/bin/sh`, matching Nix's `execvp` shell fallback. Arguments and environment are preserved; missing or non-executable hooks still fail, and the final hook result is propagated after recording captures and diagnostics.
 
 Preserve the inherited `NIX_CONFIG` when adding settings after setup:
 
