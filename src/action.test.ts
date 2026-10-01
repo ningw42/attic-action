@@ -1,9 +1,19 @@
 import { after, before, test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	chmodSync,
+	mkdtempSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSync } from "esbuild";
 
@@ -58,7 +68,35 @@ const readLog = <T>(path: string): T[] =>
 		.filter(Boolean)
 		.map((line) => JSON.parse(line) as T);
 
-const fixture = (t: TestContext, mode: Mode, options: { format?: Format; skipPush?: boolean } = {}) => {
+const readCommandFile = (path: string): Record<string, string> => {
+	const result: Record<string, string> = {};
+	const lines = readFileSync(path, "utf8").split("\n");
+	for (let i = 0; i < lines.length; i++) {
+		if (!lines[i]) continue;
+		const [key, delimiter] = lines[i]!.split("<<");
+		assert.ok(key && delimiter);
+		const value = [];
+		while (lines[++i] !== delimiter) {
+			assert.ok(i < lines.length);
+			value.push(lines[i]);
+		}
+		result[key] = value.join("\n");
+	}
+	return result;
+};
+
+const queryPrefix = ["--extra-experimental-features", "nix-command"];
+const configQuery = [...queryPrefix, "config", "show", "--json"];
+const legacyQuery = [...queryPrefix, "show-config", "--json"];
+const fixture = (
+	t: TestContext,
+	mode: Mode,
+	options: {
+		format?: Format;
+		skipPush?: boolean;
+		query?: "legacy" | "invalid" | "missing" | "malformed" | "failed";
+	} = {},
+) => {
 	const root = mkdtempSync(join(tmpdir(), "attic-action-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const bin = join(root, "bin");
@@ -86,7 +124,17 @@ const { appendFileSync, readFileSync } = require("node:fs");
 const args = process.argv.slice(2);
 const v2 = process.env.TEST_NIX_FORMAT === "v2";
 appendFileSync(process.env.TEST_NIX_LOG, JSON.stringify(args) + "\\n");
-if (JSON.stringify(args) === JSON.stringify(["path-info", "--help"])) {
+if (args[0] === "--extra-experimental-features") {
+	const calls = readFileSync(process.env.TEST_ATTIC_LOG, "utf8").trim().split("\\n").map(line => JSON.parse(line));
+	assert.equal(calls.at(-1).args[0], "use", "query effective settings only after attic use");
+	assert.deepEqual(args.slice(0, 2), ["--extra-experimental-features", "nix-command"]);
+	const modern = JSON.stringify(args.slice(2)) === JSON.stringify(["config", "show", "--json"]);
+	assert.ok(modern || JSON.stringify(args.slice(2)) === JSON.stringify(["show-config", "--json"]));
+	if (process.env.TEST_QUERY === "failed" || (modern && process.env.TEST_QUERY === "legacy")) process.exit(1);
+	if (process.env.TEST_QUERY === "malformed") console.log("not json");
+	else console.log(JSON.stringify(process.env.TEST_QUERY === "invalid" ? { "post-build-hook": { value: null } }
+		: process.env.TEST_QUERY === "missing" ? {} : { "post-build-hook": { value: process.env.TEST_ACTIVE_HOOK } }));
+} else if (JSON.stringify(args) === JSON.stringify(["path-info", "--help"])) {
 	console.log(v2 ? "path-info --json --json-format" : "path-info --json");
 } else {
 	assert.deepEqual(args, ["path-info", "--all", "--json", ...(v2 ? ["--json-format", "2"] : [])]);
@@ -123,6 +171,8 @@ appendFileSync(process.env.TEST_ATTIC_LOG, JSON.stringify({ args, stdin }) + "\\
 		GITHUB_STATE: githubState,
 		NIX_CONFIG: `post-build-hook = ${originalHook}`,
 		TEST_NIX_FORMAT: options.format ?? "v2",
+		TEST_QUERY: options.query,
+		TEST_ACTIVE_HOOK: originalHook,
 		TEST_STORE_PATHS: pathsFile,
 		TEST_NIX_LOG: nixLog,
 		TEST_ATTIC_LOG: atticLog,
@@ -136,7 +186,7 @@ appendFileSync(process.env.TEST_ATTIC_LOG, JSON.stringify({ args, stdin }) + "\\
 		"INPUT_SKIP-PUSH": options.skipPush ? "true" : "false",
 	};
 
-	const run = (command: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}) => {
+	const run = (command: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}, warning?: string) => {
 		const result = spawnSync(command, args, {
 			cwd: root,
 			env: { ...env, ...extraEnv },
@@ -147,14 +197,23 @@ appendFileSync(process.env.TEST_ATTIC_LOG, JSON.stringify({ args, stdin }) + "\\
 		assert.ifError(result.error);
 		assert.equal(result.status, 0, output);
 		// The post step catches errors without setting a failing exit code.
+		assert.deepEqual(
+			output.split("\n").filter((line) => line.startsWith("::warning::")),
+			warning ? [warning] : [],
+		);
 		assert.doesNotMatch(
 			output,
-			/::(?:error|warning)\b|Action (?:failed with|encountered) error|Not considering errors during push a failure|^\s*error:/m,
+			/::error\b|Action (?:failed with|encountered) error|Not considering errors during push a failure|^\s*error:/m,
 		);
 		assert.equal(result.stderr, "", output);
 	};
 
+	const state = () => readCommandFile(githubState);
+	const wrapper = () => join(dirname(state()["post_build_hook-paths-dir"]!), "post-build-hook.js");
 	return {
+		root,
+		state,
+		wrapper,
 		runnerTemp,
 		githubEnv,
 		snapshot: join(runnerTemp, "attic-action-store-paths"),
@@ -162,9 +221,17 @@ appendFileSync(process.env.TEST_ATTIC_LOG, JSON.stringify({ args, stdin }) + "\\
 		nixCalls: () => readLog<string[]>(nixLog),
 		atticCalls: () => readLog<AtticCall>(atticLog),
 		setup: () => run(process.execPath, [join(bundleDir, "index.js")]),
-		post: () => run(process.execPath, [join(bundleDir, "index.js")], { STATE_isPost: "true" }),
-		hook: (outPaths: string) =>
-			run(join(runnerTemp, "attic-action-post-build-hook", "post-build-hook.js"), [], { OUT_PATHS: outPaths }),
+		setupFailure: () =>
+			spawnSync(process.execPath, [join(bundleDir, "index.js")], { cwd: root, env, encoding: "utf8" }),
+		// Replay only GitHub's saved state, not exported ATTIC_* environment variables.
+		post: (warning?: string) =>
+			run(
+				process.execPath,
+				[join(bundleDir, "index.js")],
+				Object.fromEntries(Object.entries(state()).map(([key, value]) => ["STATE_" + key, value])),
+				warning,
+			),
+		hook: (outPaths: string) => run(wrapper(), [], { OUT_PATHS: outPaths }),
 	};
 };
 
@@ -196,7 +263,17 @@ test("post-build-hook pushes unique filtered outputs with quoted push-args and n
 	f.hook(kept.join("\n"));
 	f.post();
 	assert.deepEqual(f.atticCalls(), [...loginCalls, { args: expectedPushArgs, stdin: kept.join("\n") }]);
-	assert.deepEqual(f.nixCalls(), []);
+	assert.deepEqual(f.nixCalls(), [configQuery]);
+	assert.deepEqual(Object.keys(f.state()).sort(), [
+		"isPost",
+		"post_build_hook-events-log",
+		"post_build_hook-paths-dir",
+	]);
+	assert.deepEqual(Object.keys(readCommandFile(f.githubEnv)).sort(), [
+		"ATTIC_POST_BUILD_EVENTS_LOG",
+		"ATTIC_POST_BUILD_PATHS_DIR",
+		"NIX_CONFIG",
+	]);
 });
 
 for (const mode of ["store-scan", "post-build-hook"] as const) {
@@ -213,3 +290,112 @@ for (const mode of ["store-scan", "post-build-hook"] as const) {
 		assert.equal(readFileSync(f.githubEnv, "utf8"), "", "discovery should not export environment variables");
 	});
 }
+
+test("hook discovery falls back to the legacy Nix/Lix configuration query", (t) => {
+	const f = fixture(t, "post-build-hook", { query: "legacy" });
+	f.setup();
+	f.hook(kept.join(" "));
+	f.post();
+	assert.deepEqual(f.nixCalls(), [configQuery, legacyQuery]);
+	assert.deepEqual(f.atticCalls(), [...loginCalls, { args: expectedPushArgs, stdin: kept.join("\n") }]);
+});
+
+for (const query of ["invalid", "missing", "malformed", "failed"] as const) {
+	test(`hook configuration fails safely on ${query} effective configuration`, (t) => {
+		const f = fixture(t, "post-build-hook", { query });
+		const result = f.setupFailure();
+		assert.equal(result.status, 1, result.stdout + result.stderr);
+		assert.match(result.stdout, /Action failed with error/);
+		assert.deepEqual(readdirSync(f.runnerTemp), [], "must not replace a hook whose effective value is unknown");
+	});
+}
+
+test("malformed diagnostic records cannot prevent pushing legitimate hook captures", (t) => {
+	const f = fixture(t, "post-build-hook");
+	f.setup();
+	f.hook(kept.join(" "));
+	const invalid = [null, 42, "scalar", { paths: "not-an-array" }, { chained: { status: {} } }, { error: null }];
+	appendFileSync(
+		f.state()["post_build_hook-events-log"]!,
+		invalid.map((value) => JSON.stringify(value)).join("\n") + "\n",
+	);
+	f.post("::warning::Ignored 6 malformed event log line(s).");
+	assert.deepEqual(f.atticCalls(), [...loginCalls, { args: expectedPushArgs, stdin: kept.join("\n") }]);
+});
+
+test("collector directories stay private and event log stays runner-owned", (t) => {
+	const f = fixture(t, "post-build-hook");
+	f.setup();
+	f.hook(kept.join(" "));
+	const paths = f.state()["post_build_hook-paths-dir"]!;
+	const log = f.state()["post_build_hook-events-log"]!;
+	assert.equal(statSync(dirname(paths)).mode & 0o7777, 0o700);
+	assert.equal(statSync(paths).mode & 0o7777, 0o700);
+	assert.equal(statSync(log).mode & 0o7777, 0o600);
+	assert.equal(statSync(log).uid, process.getuid!());
+	f.post();
+});
+
+test(
+	"unrelated UID cannot inject captures; root hook outputs remain readable by runner",
+	{
+		skip:
+			process.env["ATTIC_TEST_PRIVILEGED"] !== "1" &&
+			"set ATTIC_TEST_PRIVILEGED=1 with passwordless sudo for cross-UID proof",
+	},
+	(t) => {
+		assert.notEqual(process.getuid!(), 0, "run as a non-root runner to exercise cross-owner readback");
+		const f = fixture(t, "post-build-hook");
+		f.setup();
+		chmodSync(f.root, 0o755);
+		chmodSync(f.runnerTemp, 0o755);
+		const probe = join(f.runnerTemp, "public-probe");
+		writeFileSync(probe, "reachable", { mode: 0o644 });
+		const paths = f.state()["post_build_hook-paths-dir"]!;
+		const log = f.state()["post_build_hook-events-log"]!;
+		const attack = spawnSync(
+			"sudo",
+			[
+				"-n",
+				"-u",
+				"#65534",
+				"--",
+				"/bin/sh",
+				"-c",
+				// The project's downloaded Node may itself live under a private home.
+				// A public shell makes the capture directory the actual access barrier.
+				'read -r marker < "$1"; test "$marker" = reachable || exit 10; if (: > "$2/paths.untrusted") 2>/dev/null; then exit 11; fi; if (printf null >> "$3") 2>/dev/null; then exit 12; fi; if ln -s "$1" "$2/paths.link" 2>/dev/null; then exit 13; fi; exit 0',
+				"capture-injection-test",
+				probe,
+				paths,
+				log,
+			],
+			{ encoding: "utf8" },
+		);
+		assert.equal(attack.status, 0, attack.stdout + attack.stderr);
+
+		const daemon = spawnSync(
+			"sudo",
+			[
+				"-n",
+				"--",
+				process.execPath,
+				"-e",
+				'process.umask(0o077); require("node:child_process").execFileSync(process.argv[1], [], {env: {...process.env, OUT_PATHS:process.argv[2]}, stdio:"inherit"});',
+				f.wrapper(),
+				kept.join(" "),
+			],
+			{ encoding: "utf8", env: { ...process.env, NODE_V8_COVERAGE: "" } },
+		);
+		assert.equal(daemon.status, 0, daemon.stdout + daemon.stderr);
+		const captured = readdirSync(paths).filter((name) => name.startsWith("paths."));
+		assert.equal(captured.length, 1);
+		assert.equal(statSync(join(paths, captured[0]!)).uid, 0);
+		assert.equal(statSync(join(paths, captured[0]!)).mode & 0o777, 0o644);
+		assert.equal(statSync(paths).uid, process.getuid!());
+		assert.equal(statSync(paths).mode & 0o777, 0o700);
+		assert.equal(statSync(log).uid, process.getuid!());
+		f.post();
+		assert.deepEqual(f.atticCalls(), [...loginCalls, { args: expectedPushArgs, stdin: kept.join("\n") }]);
+	},
+);

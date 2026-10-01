@@ -1,7 +1,8 @@
 import * as core from "@actions/core";
 import { getExecOutput } from "@actions/exec";
 
-import { chmod, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import type { HookConfig, HookEvent } from "./post-build-hook";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -37,17 +38,7 @@ export type PathDiscovery = typeof PATH_DISCOVERY_STORE_SCAN | typeof PATH_DISCO
 
 const POST_BUILD_HOOK_STATE_PREFIX = "post_build_hook";
 
-type PostBuildHookState = {
-	pathsDir: string;
-	eventsLog: string;
-	wrapper: string;
-	originalHook: string;
-};
-
-type DiscoveredHook = {
-	source: "CACHIX_DAEMON_DIR" | "NIX_CONFIG" | "NIX_USER_CONF_FILES";
-	hook: string;
-};
+type PostBuildHookState = Pick<HookConfig, "pathsDir" | "eventsLog">;
 
 export const getPathDiscovery = (): PathDiscovery => {
 	const pathDiscovery = core.getInput("path-discovery-mode") || PATH_DISCOVERY_STORE_SCAN;
@@ -94,7 +85,7 @@ export const getPostBuildHookPaths = async () => {
 	const state = getPostBuildHookState();
 	const paths = new Set<string>();
 
-	if (!(await exists(state.pathsDir))) {
+	if (!state.pathsDir || !(await exists(state.pathsDir))) {
 		return [];
 	}
 
@@ -112,16 +103,51 @@ export const getPostBuildHookPaths = async () => {
 	return Array.from(paths).sort();
 };
 
-export type HookEventRecord = {
-	ts?: string;
-	pid?: number;
-	drvPath?: string | null;
-	rawOutPaths?: string;
-	paths?: string[];
-	pathsFile?: string | null;
-	chained?: { hook: string; status: number | null; error?: string } | null;
-	skipped?: { reason: string; detail?: string };
-	error?: { message: string; stack?: string };
+export type HookEventRecord = Partial<HookEvent>;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+	typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isHookEventRecord = (value: unknown): value is HookEventRecord => {
+	if (!isRecord(value)) return false;
+	const optionalString = (object: Record<string, unknown>, key: string) =>
+		object[key] === undefined || typeof object[key] === "string";
+	for (const key of ["ts", "rawOutPaths"]) {
+		if (!optionalString(value, key)) return false;
+	}
+	for (const key of ["drvPath", "pathsFile"]) {
+		if (value[key] !== null && !optionalString(value, key)) return false;
+	}
+	if (value["pid"] !== undefined && (typeof value["pid"] !== "number" || !Number.isFinite(value["pid"]))) return false;
+	if (
+		value["paths"] !== undefined &&
+		(!Array.isArray(value["paths"]) || !value["paths"].every((path) => typeof path === "string"))
+	)
+		return false;
+	const chained = value["chained"];
+	if (
+		chained !== undefined &&
+		chained !== null &&
+		(!isRecord(chained) ||
+			typeof chained["hook"] !== "string" ||
+			(chained["status"] !== null && (typeof chained["status"] !== "number" || !Number.isFinite(chained["status"]))) ||
+			!optionalString(chained, "error") ||
+			(chained["signal"] !== null && !optionalString(chained, "signal")))
+	)
+		return false;
+	const skipped = value["skipped"];
+	if (
+		skipped !== undefined &&
+		(!isRecord(skipped) || typeof skipped["reason"] !== "string" || !optionalString(skipped, "detail"))
+	)
+		return false;
+	const error = value["error"];
+	if (
+		error !== undefined &&
+		(!isRecord(error) || typeof error["message"] !== "string" || !optionalString(error, "stack"))
+	)
+		return false;
+	return true;
 };
 
 export const summarizeHookEvent = (event: HookEventRecord, index: number): string => {
@@ -135,8 +161,10 @@ export const summarizeHookEvent = (event: HookEventRecord, index: number): strin
 		parts.push(`  skipped: ${event.skipped.reason}${event.skipped.detail ? ` — ${event.skipped.detail}` : ""}`);
 	}
 	if (event.chained) {
-		const { hook, status, error } = event.chained;
-		parts.push(`  chained: ${hook} (status=${status ?? "n/a"}${error ? `, error=${error}` : ""})`);
+		const { hook, status, signal, error } = event.chained;
+		parts.push(
+			`  chained: ${hook} (status=${status ?? "n/a"}${signal ? `, signal=${signal}` : ""}${error ? `, error=${error}` : ""})`,
+		);
 	}
 	if (event.error) parts.push(`  error:   ${event.error.message}`);
 	return parts.join("\n");
@@ -150,7 +178,7 @@ export const printPostBuildHookCaptureLog = async () => {
 	const emptyMessage =
 		"No hook invocations were captured. This usually means no new paths were built (e.g. all outputs were already in the store or fetched from a substituter), or less commonly that the collector was not installed in Nix's active config.";
 
-	if (!(await exists(eventsLog))) {
+	if (!eventsLog || !(await exists(eventsLog))) {
 		core.warning(emptyMessage);
 		core.endGroup();
 		return;
@@ -169,7 +197,9 @@ export const printPostBuildHookCaptureLog = async () => {
 	const malformed: string[] = [];
 	for (const line of lines) {
 		try {
-			events.push(JSON.parse(line));
+			const event: unknown = JSON.parse(line);
+			if (isHookEventRecord(event)) events.push(event);
+			else malformed.push(line);
 		} catch {
 			malformed.push(line);
 		}
@@ -199,50 +229,34 @@ export const printPostBuildHookCaptureLog = async () => {
 };
 
 export const configurePostBuildHookPathDiscovery = async () => {
+	// Ask Nix after attic use has updated the configuration; don't guess which
+	// config source wins or resurrect an inactive hook from another action.
+	const originalHook = await currentPostBuildHook();
 	const runnerTemp = process.env["RUNNER_TEMP"] || tmpdir();
-	const stateDir = join(runnerTemp, "attic-action-post-build-hook");
+	const stateDir = await mkdtemp(join(runnerTemp, "attic-action-post-build-hook-"));
 	const pathsDir = join(stateDir, "paths");
 	const eventsLog = join(stateDir, "events.log");
 	const wrapper = join(stateDir, "post-build-hook.js");
-	const config = join(stateDir, "nix.conf");
-	const discoveredHook = await currentPostBuildHook();
-	const originalHook = discoveredHook?.hook ?? "";
 
-	// Sticky world-writable so the nix-daemon (root) and the runner user can
-	// both read/write here regardless of which one created the dir first.
-	await mkdir(pathsDir, { recursive: true, mode: 0o1777 });
-	await chmod(pathsDir, 0o1777);
-	await writeFile(eventsLog, "", { mode: 0o666 });
-	await chmod(eventsLog, 0o666);
-	await writeFile(wrapper, postBuildHookScript({ pathsDir, eventsLog, wrapper, originalHook }), { mode: 0o755 });
-	await chmod(wrapper, 0o755);
-	await writeFile(config, `post-build-hook = ${wrapper}\n`);
+	// The runner owns these private directories. Root can write through them,
+	// but unrelated UIDs cannot inject captures even in a traversable RUNNER_TEMP.
+	await chmod(stateDir, 0o700);
+	await mkdir(pathsDir, { mode: 0o700 });
+	await chmod(pathsDir, 0o700);
+	await writeFile(eventsLog, "", { mode: 0o600 });
+	await chmod(eventsLog, 0o600);
+	await writeFile(wrapper, postBuildHookScript({ pathsDir, eventsLog, wrapper, originalHook }), { mode: 0o700 });
+	await chmod(wrapper, 0o700);
 
-	const state: PostBuildHookState = { pathsDir, eventsLog, wrapper, originalHook };
-	savePostBuildHookState(state);
+	savePostBuildHookState({ pathsDir, eventsLog });
 	core.exportVariable("ATTIC_POST_BUILD_PATHS_DIR", pathsDir);
 	core.exportVariable("ATTIC_POST_BUILD_EVENTS_LOG", eventsLog);
-	core.exportVariable("ATTIC_POST_BUILD_HOOK", wrapper);
-	core.exportVariable("ATTIC_ORIGINAL_POST_BUILD_HOOK", originalHook);
 
-	// Nix reads inline configuration from `NIX_CONFIG` (see `man nix.conf`,
-	// "Configuration file" step 3). Earlier versions of this file referenced
-	// `NIX_CONF`, which Nix does not honor — that meant any post-build-hook
-	// already set inline (e.g. by another action injecting into `NIX_CONFIG`)
-	// was silently ignored and our wrapper never composed with it.
-	if (process.env["NIX_CONFIG"]) {
-		core.exportVariable("NIX_CONFIG", `${process.env["NIX_CONFIG"]}\npost-build-hook = ${wrapper}`);
-	} else {
-		const existingNixUserConfFiles = process.env["NIX_USER_CONF_FILES"];
-		core.exportVariable(
-			"NIX_USER_CONF_FILES",
-			existingNixUserConfFiles ? `${config}:${existingNixUserConfFiles}` : config,
-		);
-	}
+	// Overlay only the hook. Setting NIX_USER_CONF_FILES would hide default
+	// user configuration, including substituters/credentials written by attic use.
+	core.exportVariable("NIX_CONFIG", `${process.env["NIX_CONFIG"] || ""}\npost-build-hook = ${wrapper}`);
 
 	core.info(`Installed Attic post-build hook collector at ${wrapper}`);
-	core.info(`Installed via post-build-hook discovery branch: ${discoveredHook?.source ?? "none"}`);
-
 	if (originalHook) {
 		core.info(`Composing with existing post-build hook: ${originalHook}`);
 	} else {
@@ -250,68 +264,37 @@ export const configurePostBuildHookPathDiscovery = async () => {
 	}
 };
 
-const savePostBuildHookState = ({ pathsDir, eventsLog, wrapper, originalHook }: PostBuildHookState) => {
+const savePostBuildHookState = ({ pathsDir, eventsLog }: PostBuildHookState) => {
 	core.saveState(`${POST_BUILD_HOOK_STATE_PREFIX}-paths-dir`, pathsDir);
 	core.saveState(`${POST_BUILD_HOOK_STATE_PREFIX}-events-log`, eventsLog);
-	core.saveState(`${POST_BUILD_HOOK_STATE_PREFIX}-wrapper`, wrapper);
-	core.saveState(`${POST_BUILD_HOOK_STATE_PREFIX}-original-hook`, originalHook);
 };
 
-const getPostBuildHookState = (): PostBuildHookState => {
-	const runnerTemp = process.env["RUNNER_TEMP"] || tmpdir();
-	const stateDir = join(runnerTemp, "attic-action-post-build-hook");
+const getPostBuildHookState = (): Partial<PostBuildHookState> => ({
+	pathsDir: core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-paths-dir`) || process.env["ATTIC_POST_BUILD_PATHS_DIR"],
+	eventsLog: core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-events-log`) || process.env["ATTIC_POST_BUILD_EVENTS_LOG"],
+});
 
-	return {
-		pathsDir:
-			core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-paths-dir`) ||
-			process.env["ATTIC_POST_BUILD_PATHS_DIR"] ||
-			join(stateDir, "paths"),
-		eventsLog:
-			core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-events-log`) ||
-			process.env["ATTIC_POST_BUILD_EVENTS_LOG"] ||
-			join(stateDir, "events.log"),
-		wrapper:
-			core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-wrapper`) ||
-			process.env["ATTIC_POST_BUILD_HOOK"] ||
-			join(stateDir, "post-build-hook.js"),
-		originalHook:
-			core.getState(`${POST_BUILD_HOOK_STATE_PREFIX}-original-hook`) ||
-			process.env["ATTIC_ORIGINAL_POST_BUILD_HOOK"] ||
-			"",
-	};
-};
-
-export const currentPostBuildHook = async (): Promise<DiscoveredHook | undefined> => {
-	const cachixDaemonDir = process.env["CACHIX_DAEMON_DIR"];
-	if (cachixDaemonDir) {
-		const hook = join(cachixDaemonDir, "post-build-hook.sh");
-		if (await exists(hook)) return { source: "CACHIX_DAEMON_DIR", hook };
+export const currentPostBuildHook = async (): Promise<string> => {
+	const flags = ["--extra-experimental-features", "nix-command"];
+	const options = { ignoreReturnCode: true, silent: true };
+	let result = await getExecOutput("nix", [...flags, "config", "show", "--json"], options);
+	if (result.exitCode !== 0) {
+		// Older Nix and Lix expose this command under the original name.
+		result = await getExecOutput("nix", [...flags, "show-config", "--json"], options);
 	}
+	if (result.exitCode !== 0) throw new Error("Could not query effective Nix configuration for post-build-hook");
 
-	const nixConfigHook = postBuildHookFromText(process.env["NIX_CONFIG"] || "");
-	if (nixConfigHook) return { source: "NIX_CONFIG", hook: nixConfigHook };
-
-	const nixUserConfFiles = process.env["NIX_USER_CONF_FILES"];
-	if (nixUserConfFiles) {
-		for (const file of nixUserConfFiles.split(":")) {
-			if (!file || !(await exists(file))) continue;
-
-			const hook = postBuildHookFromText(await readFile(file, "utf8"));
-			if (hook) return { source: "NIX_USER_CONF_FILES", hook };
-		}
+	let config: unknown;
+	try {
+		config = JSON.parse(result.stdout);
+	} catch {
+		throw new Error("Invalid effective Nix configuration JSON");
 	}
-
-	return undefined;
-};
-
-export const postBuildHookFromText = (text: string) => {
-	let hook: string | undefined;
-	for (const line of text.split(/\r?\n/)) {
-		const match = line.match(/^\s*post-build-hook\s*=\s*(.+?)\s*$/);
-		if (match?.[1]) hook = match[1].replace(/^"(.*)"$/, "$1");
+	const setting = isRecord(config) ? config["post-build-hook"] : undefined;
+	if (!isRecord(setting) || typeof setting["value"] !== "string") {
+		throw new Error("Effective Nix configuration does not contain a string post-build-hook setting");
 	}
-
-	return hook;
+	return setting["value"];
 };
 
 // The wrapper installed into Nix's `post-build-hook` is a tiny Node shim
@@ -321,7 +304,7 @@ export const postBuildHookFromText = (text: string) => {
 // hooks. Bundling lets us write the hook in TypeScript with the same
 // toolchain as the rest of the action while keeping the runtime artifact
 // fully self-contained (no `node_modules` lookup at hook time).
-export const postBuildHookScript = (state: PostBuildHookState) => {
+export const postBuildHookScript = (state: HookConfig) => {
 	// `__dirname` is defined in the bundled CJS output (`dist/index.js`) and
 	// resolves to the dist directory at runtime, so the sibling bundle
 	// `post-build-hook.js` is discoverable. When loaded as ESM (e.g. tests),

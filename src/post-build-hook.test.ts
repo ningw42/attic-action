@@ -1,30 +1,21 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { runHook, type HookConfig } from "./post-build-hook.ts";
-
-type HookEvent = {
-	ts: string;
-	pid: number;
-	drvPath: string | null;
-	rawOutPaths: string;
-	paths: string[];
-	pathsFile: string | null;
-	chained: { hook: string; status: number | null; error?: string } | null;
-	skipped?: { reason: string; detail?: string };
-	error?: { message: string; stack?: string };
-};
+import { runHook } from "./post-build-hook.ts";
+import type { HookConfig, HookEvent } from "./post-build-hook.ts";
+import { createTestEnv } from "./env-fixture.ts";
 
 const setup = () => {
 	const root = mkdtempSync(join(tmpdir(), "attic-hook-test-"));
 	const pathsDir = join(root, "paths");
 	const eventsLog = join(root, "events.log");
 	const wrapper = join(root, "wrapper.js");
-	writeFileSync(eventsLog, "");
+	mkdirSync(pathsDir, { mode: 0o700 });
+	writeFileSync(eventsLog, "", { mode: 0o600 });
 	const config: HookConfig = { pathsDir, eventsLog, wrapper, originalHook: "" };
 	return { root, config };
 };
@@ -47,22 +38,8 @@ const listPathsFiles = (pathsDir: string): string[] => {
 	}
 };
 
-// Track env mutations so we can clean up between tests.
-let savedEnv: Record<string, string | undefined> = {};
-const setEnv = (k: string, v: string | undefined) => {
-	if (!(k in savedEnv)) savedEnv[k] = process.env[k];
-	if (v === undefined) delete process.env[k];
-	else process.env[k] = v;
-};
-const restoreEnv = () => {
-	for (const [k, v] of Object.entries(savedEnv)) {
-		if (v === undefined) delete process.env[k];
-		else process.env[k] = v;
-	}
-	savedEnv = {};
-};
-
 describe("runHook", () => {
+	const { setEnv, restoreEnv } = createTestEnv();
 	let root: string;
 	let config: HookConfig;
 
@@ -124,17 +101,42 @@ describe("runHook", () => {
 		assert.equal(mode, 0o644);
 	});
 
-	test("pathsDir created with sticky world-writable bits (1777)", () => {
+	test("configured capture directories remain private (0700)", () => {
 		setEnv("OUT_PATHS", "/nix/store/abc");
 		runHook(config);
-		const mode = statSync(config.pathsDir).mode & 0o7777;
-		assert.equal(mode, 0o1777);
+		assert.equal(statSync(root).mode & 0o7777, 0o700);
+		assert.equal(statSync(config.pathsDir).mode & 0o7777, 0o700);
+		assert.equal(statSync(config.eventsLog).mode & 0o7777, 0o600);
+	});
+
+	test("missing configured pathsDir is not recreated by the hook", () => {
+		rmSync(config.pathsDir, { recursive: true });
+		setEnv("OUT_PATHS", "/nix/store/x");
+		runHook(config);
+
+		const event = readEvents(config.eventsLog)[0]!;
+		assert.match(event.error?.message ?? "", /ENOENT/);
+		assert.equal(event.pathsFile, null);
+		assert.throws(() => statSync(config.pathsDir), { code: "ENOENT" });
 	});
 
 	test("empty OUT_PATHS skips file creation and records skipped reason", () => {
 		setEnv("OUT_PATHS", "");
 		runHook(config);
 		const event = readEvents(config.eventsLog)[0]!;
+		assert.deepEqual(event.skipped, { reason: "empty OUT_PATHS" });
+		assert.equal(event.pathsFile, null);
+		assert.equal(listPathsFiles(config.pathsDir).length, 0);
+	});
+
+	test("whitespace-only OUT_PATHS skips file creation and preserves the raw input", () => {
+		const raw = " \t\n\r  ";
+		setEnv("OUT_PATHS", raw);
+		runHook(config);
+
+		const event = readEvents(config.eventsLog)[0]!;
+		assert.equal(event.rawOutPaths, raw);
+		assert.deepEqual(event.paths, []);
 		assert.deepEqual(event.skipped, { reason: "empty OUT_PATHS" });
 		assert.equal(event.pathsFile, null);
 		assert.equal(listPathsFiles(config.pathsDir).length, 0);
@@ -194,26 +196,6 @@ describe("runHook", () => {
 		assert.equal(event.chained?.error, undefined);
 	});
 
-	test("recursion guard: original==wrapper does not exec, records error", () => {
-		config.originalHook = config.wrapper;
-		setEnv("OUT_PATHS", "/nix/store/x");
-		runHook(config);
-
-		const event = readEvents(config.eventsLog)[0]!;
-		assert.equal(event.chained?.hook, config.wrapper);
-		assert.equal(event.chained?.status, null);
-		assert.match(event.chained?.error ?? "", /recursion/);
-	});
-
-	test("missing original hook → chained.error populated, no throw", () => {
-		config.originalHook = join(root, "does-not-exist");
-		setEnv("OUT_PATHS", "/nix/store/x");
-		assert.doesNotThrow(() => runHook(config));
-		const event = readEvents(config.eventsLog)[0]!;
-		assert.equal(event.chained?.status, null);
-		assert.ok(event.chained?.error);
-	});
-
 	test("OUT_PATHS with mixed whitespace (tabs, spaces, newlines) splits correctly", () => {
 		setEnv("OUT_PATHS", "  /nix/store/a\t/nix/store/b\n/nix/store/c  ");
 		runHook(config);
@@ -248,21 +230,76 @@ describe("runHook (subprocess)", () => {
 		cleanup(root);
 	});
 
-	const runInSubprocess = (env: Record<string, string>) => {
+	const runInSubprocess = (env: Record<string, string>, umask?: number) => {
 		const driver = join(root, "driver.ts");
 		// Resolve hook module from this test file's directory at runtime.
 		const hookModule = new URL("./post-build-hook.ts", import.meta.url).pathname;
 		writeFileSync(
 			driver,
-			`import { runHook } from ${JSON.stringify(hookModule)};\nrunHook(${JSON.stringify(config)});\n`,
+			`import { runHook } from ${JSON.stringify(hookModule)};\n${umask === undefined ? "" : `process.umask(${umask});\n`}runHook(${JSON.stringify(config)});\n`,
 		);
+		const childEnv = { ...process.env, ...env };
+		// An absent NODE_V8_COVERAGE is automatically re-inherited by spawnSync.
+		// Explicitly disable it: umask 0777 would create unreadable coverage files.
+		if (umask !== undefined) childEnv["NODE_V8_COVERAGE"] = "";
 		return spawnSync(process.execPath, [driver], {
-			env: { ...process.env, ...env },
+			env: childEnv,
 			encoding: "utf8",
 		});
 	};
 
-	test("original hook non-zero exit propagates as process exit code", () => {
+	const readCapturedEvent = (): HookEvent => {
+		const events = readEvents(config.eventsLog);
+		assert.equal(events.length, 1);
+		const event = events[0]!;
+		assert.deepEqual(event.paths, ["/nix/store/x"]);
+		assert.ok(event.pathsFile);
+		assert.equal(readFileSync(event.pathsFile, "utf8"), "/nix/store/x\n");
+		return event;
+	};
+
+	test("recursion guard records paths and an error, then fails without executing the wrapper", () => {
+		const marker = join(root, "recursive-marker");
+		writeFileSync(config.wrapper, `#!/usr/bin/env bash\nprintf called > ${JSON.stringify(marker)}\n`, {
+			mode: 0o755,
+		});
+		chmodSync(config.wrapper, 0o755);
+		config.originalHook = config.wrapper;
+
+		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
+		const event = readCapturedEvent();
+		assert.equal(event.chained?.hook, config.wrapper);
+		assert.equal(event.chained?.status, null);
+		assert.match(event.chained?.error ?? "", /recursion/);
+		assert.throws(() => statSync(marker), { code: "ENOENT" });
+		assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+	});
+
+	test("missing original hook records paths and a spawn error, then fails", () => {
+		config.originalHook = join(root, "does-not-exist");
+		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
+
+		const event = readCapturedEvent();
+		assert.equal(event.chained?.hook, config.originalHook);
+		assert.equal(event.chained?.status, null);
+		assert.match(event.chained?.error ?? "", /ENOENT/);
+		assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+	});
+
+	test("non-executable original hook records paths and a spawn error, then fails", () => {
+		config.originalHook = join(root, "not-executable.sh");
+		writeFileSync(config.originalHook, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o644 });
+		chmodSync(config.originalHook, 0o644);
+		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
+
+		const event = readCapturedEvent();
+		assert.equal(event.chained?.hook, config.originalHook);
+		assert.equal(event.chained?.status, null);
+		assert.match(event.chained?.error ?? "", /EACCES/);
+		assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+	});
+
+	test("original hook non-zero exit propagates after recording paths and the event", () => {
 		const orig = join(root, "fail.sh");
 		writeFileSync(orig, "#!/usr/bin/env bash\nexit 42\n", { mode: 0o755 });
 		chmodSync(orig, 0o755);
@@ -271,12 +308,59 @@ describe("runHook (subprocess)", () => {
 		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
 		assert.equal(result.status, 42, `stdout=${result.stdout}\nstderr=${result.stderr}`);
 
-		const event = readEvents(config.eventsLog)[0]!;
+		const event = readCapturedEvent();
+		assert.equal(event.chained?.hook, orig);
 		assert.equal(event.chained?.status, 42);
+	});
+
+	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+		test(`original hook ${signal} termination is propagated after recording paths and the event`, () => {
+			const orig = join(root, "signal.sh");
+			writeFileSync(orig, `#!/usr/bin/env bash\nkill -${signal} $$\n`, { mode: 0o755 });
+			chmodSync(orig, 0o755);
+			config.originalHook = orig;
+
+			const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
+			const event = readCapturedEvent();
+			assert.equal(result.status, null, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+			assert.equal(result.signal, signal);
+			assert.deepEqual(event.chained, { hook: orig, status: null, signal });
+		});
+	}
+
+	test("original hook SIGPIPE termination stays a failure even though Node ignores SIGPIPE", () => {
+		const orig = join(root, "sigpipe.sh");
+		writeFileSync(orig, "#!/usr/bin/env bash\nkill -SIGPIPE $$\n", { mode: 0o755 });
+		chmodSync(orig, 0o755);
+		config.originalHook = orig;
+
+		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
+		const event = readCapturedEvent();
+		assert.deepEqual(event.chained, { hook: orig, status: null, signal: "SIGPIPE" });
+		assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+	});
+
+	test("restrictive umask leaves capture files readable and is inherited unchanged by the original hook", () => {
+		const orig = join(root, "umask.sh");
+		writeFileSync(orig, "#!/usr/bin/env bash\numask\n", { mode: 0o755 });
+		chmodSync(orig, 0o755);
+		config.originalHook = orig;
+
+		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, 0o777);
+		assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+		const event = readEvents(config.eventsLog)[0]!;
+		assert.ok(event.pathsFile);
+		assert.equal(statSync(event.pathsFile).mode & 0o7777, 0o644);
+		assert.equal(statSync(root).mode & 0o7777, 0o700);
+		assert.equal(statSync(config.pathsDir).mode & 0o7777, 0o700);
+		assert.equal(statSync(config.eventsLog).mode & 0o7777, 0o600);
+		assert.equal(event.chained?.status, 0);
+		assert.equal(result.stdout.trim(), "0777");
 	});
 
 	test("zero exit when no original hook", () => {
 		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
 		assert.equal(result.status, 0);
+		assert.equal(readCapturedEvent().chained, null);
 	});
 });

@@ -7,10 +7,8 @@ import { join } from "node:path";
 
 import {
 	applyPathFilters,
-	currentPostBuildHook,
 	excludeTemporaryPaths,
 	getPostBuildHookPaths,
-	postBuildHookFromText,
 	postBuildHookScript,
 	summarizeHookEvent,
 	type HookEventRecord,
@@ -41,20 +39,7 @@ const runPrintInSubprocess = (env: Record<string, string | undefined>) => {
 	});
 };
 
-// Track env mutations so we can clean up between tests.
-let savedEnv: Record<string, string | undefined> = {};
-const setEnv = (k: string, v: string | undefined) => {
-	if (!(k in savedEnv)) savedEnv[k] = process.env[k];
-	if (v === undefined) delete process.env[k];
-	else process.env[k] = v;
-};
-const restoreEnv = () => {
-	for (const [k, v] of Object.entries(savedEnv)) {
-		if (v === undefined) delete process.env[k];
-		else process.env[k] = v;
-	}
-	savedEnv = {};
-};
+import { createTestEnv } from "./env-fixture.ts";
 
 describe("excludeTemporaryPaths", () => {
 	test("drops .drv, .drv.chroot, .check, .lock", () => {
@@ -80,6 +65,7 @@ describe("excludeTemporaryPaths", () => {
 });
 
 describe("applyPathFilters", () => {
+	const { setEnv, restoreEnv } = createTestEnv();
 	afterEach(() => restoreEnv());
 
 	const paths = [
@@ -161,6 +147,13 @@ describe("summarizeHookEvent", () => {
 		assert.match(summarizeHookEvent(event, 0), /chained:\s+\/orig \(status=n\/a, error=boom\)/);
 	});
 
+	test("chained signal renders", () => {
+		assert.match(
+			summarizeHookEvent({ chained: { hook: "/orig", status: null, signal: "SIGTERM" } }, 0),
+			/chained:\s+\/orig \(status=n\/a, signal=SIGTERM\)/,
+		);
+	});
+
 	test("error field renders", () => {
 		const event: HookEventRecord = {
 			ts: "x",
@@ -184,7 +177,6 @@ describe("printPostBuildHookCaptureLog", () => {
 	});
 
 	afterEach(() => {
-		restoreEnv();
 		rmSync(root, { recursive: true, force: true });
 	});
 
@@ -222,6 +214,36 @@ describe("printPostBuildHookCaptureLog", () => {
 		assert.match(result.stdout, /#2 t2 pid=2/);
 		assert.match(result.stdout, /#3 t3 pid=3/);
 		assert.match(result.stdout, /skipped:\s+empty OUT_PATHS/);
+	});
+
+	test("invalid JSON shapes are skipped while valid partial records remain readable", () => {
+		const invalid = [
+			null,
+			1,
+			"text",
+			true,
+			[],
+			{ paths: "bad" },
+			{ paths: [null] },
+			{ pid: {} },
+			{ ts: [] },
+			{ drvPath: 42 },
+			{ pathsFile: false },
+			{ rawOutPaths: [] },
+			{ chained: [] },
+			{ chained: { hook: [], status: 0 } },
+			{ chained: { hook: "/hook", status: {} } },
+			{ skipped: null },
+			{ skipped: { reason: {} } },
+			{ error: [] },
+			{ error: { message: [] } },
+		];
+		const records = [...invalid, {}, { paths: ["/nix/store/valid"] }];
+		writeFileSync(join(root, "events.log"), records.map((value) => JSON.stringify(value)).join("\n"));
+		const result = run();
+		assert.equal(result.status, 0, result.stderr);
+		assert.match(result.stdout, /Captured 2 hook invocation\(s\); 1 path\(s\)/);
+		assert.match(result.stdout, /Ignored 19 malformed event log line\(s\)/);
 	});
 
 	test("malformed lines tolerated, warning emitted", () => {
@@ -284,96 +306,8 @@ describe("postBuildHookScript (wrapper shebang)", () => {
 	});
 });
 
-describe("postBuildHookFromText", () => {
-	test("extracts post-build-hook from inline nix config", () => {
-		const text = "experimental-features = nix-command flakes\npost-build-hook = /run/cachix/hook.sh\n";
-		assert.equal(postBuildHookFromText(text), "/run/cachix/hook.sh");
-	});
-
-	test("strips surrounding double quotes", () => {
-		assert.equal(postBuildHookFromText('post-build-hook = "/quoted/hook.sh"'), "/quoted/hook.sh");
-	});
-
-	test("returns undefined when not present", () => {
-		assert.equal(postBuildHookFromText("experimental-features = flakes\n"), undefined);
-		assert.equal(postBuildHookFromText(""), undefined);
-	});
-
-	test("last occurrence wins (matches Nix's behavior)", () => {
-		const text = "post-build-hook = /first\npost-build-hook = /second\n";
-		assert.equal(postBuildHookFromText(text), "/second");
-	});
-});
-
-describe("currentPostBuildHook (discovery branches)", () => {
-	let root: string;
-
-	beforeEach(() => {
-		root = mkdtempSync(join(tmpdir(), "attic-discovery-test-"));
-		// Clear all discovery-relevant env vars so each test starts from a
-		// known baseline rather than picking up state from CI / dev machine.
-		setEnv("CACHIX_DAEMON_DIR", undefined);
-		setEnv("NIX_CONFIG", undefined);
-		setEnv("NIX_USER_CONF_FILES", undefined);
-	});
-
-	afterEach(() => {
-		restoreEnv();
-		rmSync(root, { recursive: true, force: true });
-	});
-
-	test("finds hook via CACHIX_DAEMON_DIR when post-build-hook.sh exists", async () => {
-		const hook = join(root, "post-build-hook.sh");
-		writeFileSync(hook, "#!/bin/sh\n", { mode: 0o755 });
-		setEnv("CACHIX_DAEMON_DIR", root);
-
-		const result = await currentPostBuildHook();
-		assert.deepEqual(result, { source: "CACHIX_DAEMON_DIR", hook });
-	});
-
-	test("ignores CACHIX_DAEMON_DIR when the expected file is absent", async () => {
-		setEnv("CACHIX_DAEMON_DIR", root);
-		assert.equal(await currentPostBuildHook(), undefined);
-	});
-
-	test("finds hook via NIX_CONFIG inline config (not NIX_CONF)", async () => {
-		setEnv("NIX_CONFIG", "post-build-hook = /from/nix/config.sh");
-		const result = await currentPostBuildHook();
-		assert.deepEqual(result, { source: "NIX_CONFIG", hook: "/from/nix/config.sh" });
-	});
-
-	test("legacy NIX_CONF is intentionally not honored (Nix does not read it)", async () => {
-		setEnv("NIX_CONF", "post-build-hook = /legacy/hook.sh");
-		assert.equal(await currentPostBuildHook(), undefined);
-	});
-
-	test("finds hook via NIX_USER_CONF_FILES (first colon-separated file with a hook wins)", async () => {
-		const confA = join(root, "a.conf");
-		const confB = join(root, "b.conf");
-		writeFileSync(confA, "experimental-features = flakes\n");
-		writeFileSync(confB, "post-build-hook = /from/conf/b.sh\n");
-		setEnv("NIX_USER_CONF_FILES", `${confA}:${confB}`);
-
-		const result = await currentPostBuildHook();
-		assert.deepEqual(result, { source: "NIX_USER_CONF_FILES", hook: "/from/conf/b.sh" });
-	});
-
-	test("CACHIX_DAEMON_DIR takes precedence over NIX_CONFIG", async () => {
-		const hook = join(root, "post-build-hook.sh");
-		writeFileSync(hook, "#!/bin/sh\n", { mode: 0o755 });
-		setEnv("CACHIX_DAEMON_DIR", root);
-		setEnv("NIX_CONFIG", "post-build-hook = /from/nix/config.sh");
-
-		const result = await currentPostBuildHook();
-		assert.equal(result?.source, "CACHIX_DAEMON_DIR");
-	});
-
-	test("returns undefined when no source provides a hook", async () => {
-		assert.equal(await currentPostBuildHook(), undefined);
-	});
-});
-
 describe("getPostBuildHookPaths (round-trip with hook output)", () => {
+	const { setEnv, restoreEnv } = createTestEnv();
 	let root: string;
 	let pathsDir: string;
 

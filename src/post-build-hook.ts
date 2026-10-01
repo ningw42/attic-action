@@ -7,7 +7,7 @@
 // bundle and calls `runHook` with absolute paths baked in. We avoid
 // environment variables because the nix-daemon strips/normalizes them.
 
-import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
@@ -35,14 +35,14 @@ export type HookConfig = {
 // filtering (temporary paths, include/exclude regexes) happens in the post
 // step so there is one source of truth and the capture log honestly reflects
 // what the daemon told us.
-type HookEvent = {
+export type HookEvent = {
 	ts: string;
 	pid: number;
 	drvPath: string | null;
 	rawOutPaths: string;
 	paths: string[];
 	pathsFile: string | null;
-	chained: { hook: string; status: number | null; error?: string } | null;
+	chained: { hook: string; status: number | null; signal?: NodeJS.Signals | null; error?: string } | null;
 	skipped?: { reason: string; detail?: string };
 	error?: { message: string; stack?: string };
 };
@@ -64,26 +64,15 @@ const recordOutPaths = (config: HookConfig, event: HookEvent): void => {
 		return;
 	}
 
-	mkdirSync(config.pathsDir, { recursive: true, mode: 0o1777 });
-	// Counter the daemon's potentially restrictive umask so that the runner
-	// user can read these files back in the post step.
-	try {
-		chmodSync(config.pathsDir, 0o1777);
-	} catch {
-		// Best-effort; if we can't chmod we still try to write readable files.
-	}
-
 	const all = splitOutPaths(raw);
 	event.paths = all;
 
-	if (all.length === 0) {
-		event.skipped = { reason: "no paths in OUT_PATHS" };
-		return;
-	}
-
 	const tmp = join(config.pathsDir, `paths.${randomBytes(6).toString("hex")}`);
-	writeFileSync(tmp, all.join("\n") + "\n", { mode: 0o644 });
-	// Explicit chmod in case `mode` was masked by the daemon's umask.
+	// Configure owns the private capture directories; never recreate or
+	// relax their permissions from this potentially root-owned process.
+	writeFileSync(tmp, all.join("\n") + "\n", { mode: 0o644, flag: "wx" });
+	// Keep root-owned files runner-readable even with a restrictive umask.
+	// Other users cannot traverse the enclosing private directories.
 	chmodSync(tmp, 0o644);
 	event.pathsFile = tmp;
 };
@@ -110,12 +99,10 @@ const chainOriginalHook = (config: HookConfig, event: HookEvent): void => {
 		return;
 	}
 
-	event.chained = { hook: config.originalHook, status: result.status };
+	event.chained = { hook: config.originalHook, status: result.status, signal: result.signal };
 };
 
 export const runHook = (config: HookConfig) => {
-	process.umask(0o022);
-
 	const event: HookEvent = {
 		ts: new Date().toISOString(),
 		pid: process.pid,
@@ -137,6 +124,18 @@ export const runHook = (config: HookConfig) => {
 
 	chainOriginalHook(config, event);
 	writeEvent(config, event);
+
+	// Spawn failures and recursive configurations are failures too, but only
+	// terminate after the paths and the chained-hook diagnostics are recorded.
+	if (event.chained?.error) process.exit(1);
+
+	if (event.chained?.signal) {
+		// Reproduce the child's termination for Nix. Retain a nonzero fallback
+		// if the runtime handles or ignores this signal instead of terminating.
+		process.exitCode = 1;
+		process.kill(process.pid, event.chained.signal);
+		return;
+	}
 
 	if (event.chained && typeof event.chained.status === "number" && event.chained.status !== 0) {
 		process.exit(event.chained.status);
