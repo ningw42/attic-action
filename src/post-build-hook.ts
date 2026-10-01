@@ -79,10 +79,15 @@ const recordOutPaths = (config: HookConfig, event: HookEvent): void => {
 const chainOriginalHook = (config: HookConfig, event: HookEvent): void => {
 	if (!config.originalHook) return;
 
-	const result = spawnSync(config.originalHook, process.argv.slice(2), {
-		stdio: "inherit",
-		env: process.env,
-	});
+	const args = process.argv.slice(2);
+	const options = { stdio: "inherit" as const, env: process.env };
+	let result = spawnSync(config.originalHook, args, options);
+	if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ENOEXEC") {
+		// Match execvp's shell fallback for executable text without a valid
+		// shebang (e.g. Cachix's leading newline). Darwin's spawn does not do
+		// this for us. Keep the path and arguments literal, not shell source.
+		result = spawnSync("/bin/sh", [config.originalHook, ...args], options);
+	}
 
 	if (result.error) {
 		event.chained = { hook: config.originalHook, status: null, error: result.error.message };

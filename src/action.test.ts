@@ -130,7 +130,7 @@ const fixture = (
 		query?: "legacy" | "invalid" | "missing" | "malformed" | "failed";
 		trust?: Trust;
 		validity?: Validity;
-		originalHook?: "success" | "nonzero" | "signal" | "missing";
+		originalHook?: "success" | "malformed-header" | "nonzero" | "signal" | "missing";
 	} = {},
 ) => {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "attic-action-test-")));
@@ -239,7 +239,7 @@ const stdin = args[0] === "push" ? readFileSync(0, "utf8") : "";
 appendFileSync(process.env.TEST_ATTIC_LOG, JSON.stringify({ args, stdin }) + "\\n");
 `,
 	);
-	const originalHook = options.originalHook
+	let originalHook = options.originalHook
 		? options.originalHook === "missing"
 			? join(bin, "missing-original-hook")
 			: executable(
@@ -249,6 +249,16 @@ if (process.env.TEST_CHAIN === "signal") process.kill(process.pid, "SIGTERM");
 else process.exit(process.env.TEST_CHAIN === "nonzero" ? 7 : 0);`,
 				)
 		: "";
+
+	if (options.originalHook === "malformed-header") {
+		originalHook = join(bin, "cachix's post-build-hook.sh");
+		// Cachix generates a leading newline and indentation before its shebang.
+		// This wrapper delegates to the original-hook executable created above.
+		// Exercise this via the generated launcher and bundled collector on macOS.
+		writeFileSync(originalHook, '\n    #!/usr/bin/env bash\n    set -eu\n    exec original-hook "$@"\n', {
+			mode: 0o755,
+		});
+	}
 
 	// Make getExecOutput reject only for the trust command. Removing nix itself
 	// would also break the later effective-config query, obscuring policy.
@@ -422,15 +432,17 @@ test("default post-build-hook pushes unique filtered outputs without warnings, a
 	]);
 });
 
-test("an explicitly configured original hook is still chained with its arguments and outputs", (t) => {
-	const f = fixture(t, "post-build-hook", { originalHook: "success" });
-	assert.match(f.setup(), /Composing with existing post-build hook:/);
-	const args = ["one argument", "two"];
-	f.hook(kept.join(" "), args);
-	assert.deepEqual(f.chainCalls(), [{ args, outPaths: kept.join(" ") }]);
-	f.post();
-	assert.deepEqual(f.atticCalls(), [...loginCalls, { args: expectedPushArgs, stdin: kept.join("\n") }]);
-});
+for (const originalHook of ["success", "malformed-header"] as const) {
+	test(`an explicitly configured original hook (${originalHook}) is still chained with its arguments and outputs`, (t) => {
+		const f = fixture(t, "post-build-hook", { originalHook });
+		assert.match(f.setup(), /Composing with existing post-build hook:/);
+		const args = ["one argument", "", "it's literal; $(exit 99) *", "--flag"];
+		f.hook(kept.join(" "), args);
+		assert.deepEqual(f.chainCalls(), [{ args, outPaths: kept.join(" ") }]);
+		f.post();
+		assert.deepEqual(f.atticCalls(), [...loginCalls, { args: expectedPushArgs, stdin: kept.join("\n") }]);
+	});
+}
 
 for (const mode of ["store-scan", "post-build-hook"] as const) {
 	test(`skip-push avoids all discovery and pushes in ${mode} mode`, (t) => {

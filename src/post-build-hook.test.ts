@@ -229,19 +229,46 @@ describe("runHook (subprocess)", () => {
 		cleanup(root);
 	});
 
-	const runInSubprocess = (env: Record<string, string>, umask?: number) => {
+	const useHook = (name: string, source: string, mode = 0o755) => {
+		config.originalHook = join(root, name);
+		writeFileSync(config.originalHook, source);
+		chmodSync(config.originalHook, mode);
+		return config.originalHook;
+	};
+
+	const runInSubprocess = (
+		env: Record<string, string>,
+		{ umask, args = [], spawnErrors = [] }: { umask?: number; args?: string[]; spawnErrors?: string[] } = {},
+	) => {
 		const driver = join(root, "driver.ts");
+		// Linux masks malformed executable headers with its own shell fallback.
+		// Inject errors only at the OS boundary, inside the isolated child process;
+		// once exhausted, the retry executes a real shell and hook.
+		const spawnErrorPreamble = spawnErrors.length
+			? `import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const realSpawnSync = childProcess.spawnSync;
+const errors = ${JSON.stringify(spawnErrors)};
+childProcess.spawnSync = (command, ...args) => {
+	const code = errors.shift();
+	if (code) return { pid: 0, output: null, stdout: null, stderr: null, status: null, signal: null,
+		error: Object.assign(new Error("spawnSync " + command + " " + code), { code }) };
+	return realSpawnSync(command, ...args);
+};
+syncBuiltinESMExports();
+`
+			: "";
 		// Resolve hook module from this test file's directory at runtime.
 		const hookModule = new URL("./post-build-hook.ts", import.meta.url).pathname;
 		writeFileSync(
 			driver,
-			`import { runHook } from ${JSON.stringify(hookModule)};\n${umask === undefined ? "" : `process.umask(${umask});\n`}runHook(${JSON.stringify(config)});\n`,
+			`${spawnErrorPreamble}import { runHook } from ${JSON.stringify(hookModule)};\n${umask === undefined ? "" : `process.umask(${umask});\n`}runHook(${JSON.stringify(config)});\n`,
 		);
 		const childEnv = { ...process.env, ...env };
 		// An absent NODE_V8_COVERAGE is automatically re-inherited by spawnSync.
 		// Explicitly disable it: umask 0777 would create unreadable coverage files.
 		if (umask !== undefined) childEnv["NODE_V8_COVERAGE"] = "";
-		return spawnSync(process.execPath, [driver], {
+		return spawnSync(process.execPath, [driver, ...args], {
 			env: childEnv,
 			encoding: "utf8",
 		});
@@ -269,9 +296,7 @@ describe("runHook (subprocess)", () => {
 	});
 
 	test("non-executable original hook records paths and a spawn error, then fails", () => {
-		config.originalHook = join(root, "not-executable.sh");
-		writeFileSync(config.originalHook, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o644 });
-		chmodSync(config.originalHook, 0o644);
+		useHook("not-executable.sh", "#!/usr/bin/env bash\nexit 0\n", 0o644);
 		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
 
 		const event = readCapturedEvent();
@@ -281,64 +306,86 @@ describe("runHook (subprocess)", () => {
 		assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
 	});
 
-	test("original hook non-zero exit propagates after recording paths and the event", () => {
-		const orig = join(root, "fail.sh");
-		writeFileSync(orig, "#!/usr/bin/env bash\nexit 42\n", { mode: 0o755 });
-		chmodSync(orig, 0o755);
-		config.originalHook = orig;
+	for (const spawnErrors of [[], ["ENOEXEC"]]) {
+		describe(spawnErrors.length ? "forced ENOEXEC shell fallback" : "native spawn", () => {
+			test("malformed-header hook forwards literal arguments, OUT_PATHS and stdio", () => {
+				useHook(
+					"cachix's hook $(exit 99).sh",
+					`\n    #!/usr/bin/env bash\n    set -eu\n    printf '%s\\n' "$OUT_PATHS" "$#" "$@"\n    printf 'chained stderr\\n' >&2\n`,
+				);
+				const result = runInSubprocess(
+					{ OUT_PATHS: "/nix/store/x" },
+					{ args: ["two words", "", "it's literal; $(exit 99) *", "--flag"], spawnErrors },
+				);
 
-		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
-		assert.equal(result.status, 42, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+				assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+				assert.equal(result.stdout, "/nix/store/x\n4\ntwo words\n\nit's literal; $(exit 99) *\n--flag\n");
+				assert.match(result.stderr, /^chained stderr$/m);
+				assert.deepEqual(readCapturedEvent().chained, { hook: config.originalHook, status: 0, signal: null });
+			});
 
-		const event = readCapturedEvent();
-		assert.equal(event.chained?.hook, orig);
-		assert.equal(event.chained?.status, 42);
-	});
+			test("original hook non-zero exit propagates after recording paths and the event", () => {
+				const orig = useHook("fail.sh", "#!/usr/bin/env bash\nexit 42\n");
 
-	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-		test(`original hook ${signal} termination is propagated after recording paths and the event`, () => {
-			const orig = join(root, "signal.sh");
-			writeFileSync(orig, `#!/usr/bin/env bash\nkill -${signal} $$\n`, { mode: 0o755 });
-			chmodSync(orig, 0o755);
-			config.originalHook = orig;
+				const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors });
+				assert.equal(result.status, 42, `stdout=${result.stdout}\nstderr=${result.stderr}`);
 
-			const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
-			const event = readCapturedEvent();
-			assert.equal(result.status, null, `stdout=${result.stdout}\nstderr=${result.stderr}`);
-			assert.equal(result.signal, signal);
-			assert.deepEqual(event.chained, { hook: orig, status: null, signal });
+				const event = readCapturedEvent();
+				assert.equal(event.chained?.hook, orig);
+				assert.equal(event.chained?.status, 42);
+			});
+
+			for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+				test(`original hook ${signal} termination is propagated after recording paths and the event`, () => {
+					const orig = useHook("signal.sh", `#!/usr/bin/env bash\nkill -s ${signal.slice(3)} $$\n`);
+
+					const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors });
+					const event = readCapturedEvent();
+					assert.equal(result.status, null, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+					assert.equal(result.signal, signal);
+					assert.deepEqual(event.chained, { hook: orig, status: null, signal });
+				});
+			}
+
+			test("original hook SIGPIPE termination stays a failure even though Node ignores SIGPIPE", () => {
+				const orig = useHook("sigpipe.sh", "#!/usr/bin/env bash\nkill -s PIPE $$\n");
+
+				const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors });
+				const event = readCapturedEvent();
+				assert.deepEqual(event.chained, { hook: orig, status: null, signal: "SIGPIPE" });
+				assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+			});
+
+			test("restrictive umask leaves capture files readable and is inherited unchanged by the original hook", () => {
+				const orig = useHook("umask.sh", "#!/usr/bin/env bash\numask\n");
+
+				const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { umask: 0o777, spawnErrors });
+				assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+				const event = readEvents(config.eventsLog)[0]!;
+				assert.ok(event.pathsFile);
+				assert.equal(statSync(event.pathsFile).mode & 0o7777, 0o644);
+				assert.equal(statSync(root).mode & 0o7777, 0o700);
+				assert.equal(statSync(config.pathsDir).mode & 0o7777, 0o700);
+				assert.equal(statSync(config.eventsLog).mode & 0o7777, 0o600);
+				assert.equal(event.chained?.status, 0);
+				assert.equal(result.stdout.trim(), "0777");
+			});
 		});
 	}
 
-	test("original hook SIGPIPE termination stays a failure even though Node ignores SIGPIPE", () => {
-		const orig = join(root, "sigpipe.sh");
-		writeFileSync(orig, "#!/usr/bin/env bash\nkill -SIGPIPE $$\n", { mode: 0o755 });
-		chmodSync(orig, 0o755);
-		config.originalHook = orig;
+	for (const code of ["ENOENT", "ENOEXEC"]) {
+		test(`failed shell spawn records the final ${code} error without another retry`, () => {
+			useHook("orig.sh", "exit 0\n");
+			const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, { spawnErrors: ["ENOEXEC", code] });
 
-		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
-		const event = readCapturedEvent();
-		assert.deepEqual(event.chained, { hook: orig, status: null, signal: "SIGPIPE" });
-		assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
-	});
-
-	test("restrictive umask leaves capture files readable and is inherited unchanged by the original hook", () => {
-		const orig = join(root, "umask.sh");
-		writeFileSync(orig, "#!/usr/bin/env bash\numask\n", { mode: 0o755 });
-		chmodSync(orig, 0o755);
-		config.originalHook = orig;
-
-		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" }, 0o777);
-		assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
-		const event = readEvents(config.eventsLog)[0]!;
-		assert.ok(event.pathsFile);
-		assert.equal(statSync(event.pathsFile).mode & 0o7777, 0o644);
-		assert.equal(statSync(root).mode & 0o7777, 0o700);
-		assert.equal(statSync(config.pathsDir).mode & 0o7777, 0o700);
-		assert.equal(statSync(config.eventsLog).mode & 0o7777, 0o600);
-		assert.equal(event.chained?.status, 0);
-		assert.equal(result.stdout.trim(), "0777");
-	});
+			assert.equal(result.status, 1, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+			assert.deepEqual(readCapturedEvent().chained, {
+				hook: config.originalHook,
+				status: null,
+				error: `spawnSync /bin/sh ${code}`,
+			});
+		});
+	}
 
 	test("zero exit when no original hook", () => {
 		const result = runInSubprocess({ OUT_PATHS: "/nix/store/x" });
